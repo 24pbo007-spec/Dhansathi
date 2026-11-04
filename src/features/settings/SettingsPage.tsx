@@ -127,6 +127,17 @@ function getProfileFormFromUser(user?: UserProfile | null) {
     current_year: user?.current_year || '',
     last_exam_percentage: user?.last_exam_percentage?.toString() || '',
     is_hosteller: user?.is_hosteller || false,
+    stream: user?.stream || '',
+    institution_type: (user?.institution_type || '') as UserProfile['institution_type'] | '',
+    parent_occupation: user?.parent_occupation || '',
+    is_minority: user?.is_minority || false,
+    is_farmer_family: user?.is_farmer_family || false,
+    is_orphan_single_parent: user?.is_orphan_single_parent || false,
+    is_ex_serviceman_family: user?.is_ex_serviceman_family || false,
+    has_income_certificate: user?.has_income_certificate || false,
+    has_caste_certificate: user?.has_caste_certificate || false,
+    has_domicile_certificate: user?.has_domicile_certificate || false,
+    is_aadhaar_bank_linked: user?.is_aadhaar_bank_linked || false,
   };
 }
 
@@ -244,6 +255,17 @@ export default function SettingsPage() {
       current_year: profileForm.current_year || undefined,
       last_exam_percentage: profileForm.last_exam_percentage ? Number(profileForm.last_exam_percentage) : undefined,
       is_hosteller: profileForm.is_hosteller,
+      stream: profileForm.stream || undefined,
+      institution_type: profileForm.institution_type || undefined,
+      parent_occupation: profileForm.parent_occupation || undefined,
+      is_minority: profileForm.is_minority,
+      is_farmer_family: profileForm.is_farmer_family,
+      is_orphan_single_parent: profileForm.is_orphan_single_parent,
+      is_ex_serviceman_family: profileForm.is_ex_serviceman_family,
+      has_income_certificate: profileForm.has_income_certificate,
+      has_caste_certificate: profileForm.has_caste_certificate,
+      has_domicile_certificate: profileForm.has_domicile_certificate,
+      is_aadhaar_bank_linked: profileForm.is_aadhaar_bank_linked,
     };
 
     try {
@@ -638,7 +660,7 @@ export default function SettingsPage() {
                       )}
                     />
                   </button>
-                  <span className="text-sm text-on-surface font-medium">{lang === 'hi' ? 'दिव्यांग छात्र' : 'Student with disability'}</span>
+                  <span className="text-sm text-on-surface font-medium">{lang === 'hi' ? 'दिव्यांग व्यक्ति' : 'Person with disability'}</span>
                 </div>
               </div>
 
@@ -746,6 +768,73 @@ export default function SettingsPage() {
                     </button>
                     <span className="text-sm text-on-surface font-medium">{lang === 'hi' ? 'हॉस्टल में रहते हैं' : 'Living in hostel'}</span>
                   </div>
+
+                  <div>
+                    <label className="text-xs font-bold text-on-surface-variant uppercase tracking-wider mb-1.5 block">
+                      {lang === 'hi' ? 'स्ट्रीम / विषय' : 'Stream / Subject'}
+                    </label>
+                    <input
+                      type="text"
+                      value={profileForm.stream}
+                      onChange={(e) => updateProfileField('stream', e.target.value)}
+                      className="w-full px-4 py-2.5 rounded-xl bg-surface-container-low border border-outline-variant/40 text-on-surface text-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
+                      placeholder={lang === 'hi' ? 'जैसे Science, Commerce, Engineering' : 'e.g. Science, Commerce, Engineering'}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-bold text-on-surface-variant uppercase tracking-wider mb-1.5 block">
+                      {lang === 'hi' ? 'संस्थान का प्रकार' : 'Institution Type'}
+                    </label>
+                    <select
+                      value={profileForm.institution_type}
+                      onChange={(e) => updateProfileField('institution_type', e.target.value)}
+                      className="w-full px-4 py-2.5 rounded-xl bg-surface-container-low border border-outline-variant/40 text-on-surface text-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
+                    >
+                      <option value="">{lang === 'hi' ? 'चुनें' : 'Select type'}</option>
+                      <option value="government">{lang === 'hi' ? 'सरकारी' : 'Government'}</option>
+                      <option value="aided">{lang === 'hi' ? 'सरकारी सहायता प्राप्त' : 'Government-aided'}</option>
+                      <option value="private">{lang === 'hi' ? 'प्राइवेट' : 'Private'}</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-8 border-t border-outline-variant/20 pt-6">
+                <div className="flex items-center gap-2 mb-5">
+                  <span className="material-symbols-outlined text-primary text-xl">family_restroom</span>
+                  <div>
+                    <h5 className="font-headline font-bold text-on-surface">{lang === 'hi' ? 'परिवार और दस्तावेज़' : 'Family & Documents'}</h5>
+                    <p className="text-xs text-on-surface-variant mt-0.5">
+                      {lang === 'hi'
+                        ? 'Ask DhanSathi इन्हीं जानकारियों से आपके लिए योजनाएं और छात्रवृत्ति चुनता है।'
+                        : 'Ask DhanSathi uses these to pick schemes and scholarships you qualify for.'}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mb-4 max-w-md">
+                  <label className="text-xs font-bold text-on-surface-variant uppercase tracking-wider mb-1.5 block">
+                    {lang === 'hi' ? 'माता-पिता का व्यवसाय' : "Parent's Occupation"}
+                  </label>
+                  <input
+                    type="text"
+                    value={profileForm.parent_occupation}
+                    onChange={(e) => updateProfileField('parent_occupation', e.target.value)}
+                    className="w-full px-4 py-2.5 rounded-xl bg-surface-container-low border border-outline-variant/40 text-on-surface text-sm focus:outline-none focus:ring-2 focus:ring-primary/40 transition-shadow"
+                    placeholder={lang === 'hi' ? 'जैसे किसान, मजदूर, दुकानदार' : 'e.g. farmer, labourer, shopkeeper'}
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8">
+                  <Toggle checked={profileForm.is_minority} onChange={(v) => updateProfileField('is_minority', v)} label={lang === 'hi' ? 'अल्पसंख्यक समुदाय' : 'Minority community'} />
+                  <Toggle checked={profileForm.is_farmer_family} onChange={(v) => updateProfileField('is_farmer_family', v)} label={lang === 'hi' ? 'किसान परिवार' : 'Farmer family'} />
+                  <Toggle checked={profileForm.is_orphan_single_parent} onChange={(v) => updateProfileField('is_orphan_single_parent', v)} label={lang === 'hi' ? 'अनाथ / एकल अभिभावक' : 'Orphan / single parent'} />
+                  <Toggle checked={profileForm.is_ex_serviceman_family} onChange={(v) => updateProfileField('is_ex_serviceman_family', v)} label={lang === 'hi' ? 'पूर्व सैनिक परिवार' : 'Ex-serviceman family'} />
+                  <Toggle checked={profileForm.has_income_certificate} onChange={(v) => updateProfileField('has_income_certificate', v)} label={lang === 'hi' ? 'आय प्रमाण पत्र है' : 'Have income certificate'} />
+                  <Toggle checked={profileForm.has_caste_certificate} onChange={(v) => updateProfileField('has_caste_certificate', v)} label={lang === 'hi' ? 'जाति प्रमाण पत्र है' : 'Have caste certificate'} />
+                  <Toggle checked={profileForm.has_domicile_certificate} onChange={(v) => updateProfileField('has_domicile_certificate', v)} label={lang === 'hi' ? 'निवास प्रमाण पत्र है' : 'Have domicile certificate'} />
+                  <Toggle checked={profileForm.is_aadhaar_bank_linked} onChange={(v) => updateProfileField('is_aadhaar_bank_linked', v)} label={lang === 'hi' ? 'बैंक खाता आधार से जुड़ा है' : 'Bank account linked to Aadhaar'} />
                 </div>
               </div>
 

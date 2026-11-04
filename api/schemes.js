@@ -1,25 +1,11 @@
-// Live government-schemes feed, served straight from myScheme.
-// No env vars or GitHub token required — the site works out of the box.
-//
-// MYSCHEME_API_KEY is the public x-api-key that myscheme.gov.in ships to
-// every visitor's browser (visible in DevTools > Network). It is not a
-// private secret. An env var of the same name overrides the default if
-// myScheme ever rotates it.
+// Live government-schemes feed, served straight from myScheme (central +
+// every state/UT). No env vars or GitHub token required. The response is
+// edge-cached until 00:30 IST, so the catalogue refreshes once a day.
+
+import { dailyCacheHeader, fetchAllMySchemeItems, isPastDate, toIsoDate } from './_lib/myscheme.js';
+import { rateLimit } from './_lib/ratelimit.js';
 
 export const config = { maxDuration: 60 };
-
-const API_KEY =
-  process.env.MYSCHEME_API_KEY || 'tYTy5eEhlu9rFjyxuCr7ra7ACp4dv1RH8gWuHTDc';
-const SEARCH_URL = 'https://api.myscheme.gov.in/search/v6/schemes';
-const PAGE_SIZE = 100;
-const PARALLEL_PAGES = 10;
-
-const headers = {
-  origin: 'https://www.myscheme.gov.in',
-  referer: 'https://www.myscheme.gov.in/',
-  'user-agent': 'Mozilla/5.0 (DhanSathi scheme updater)',
-  'x-api-key': API_KEY,
-};
 
 function slugify(value) {
   return String(value || '')
@@ -28,98 +14,63 @@ function slugify(value) {
     .replace(/(^-|-$)/g, '');
 }
 
-function mapScheme(item, now) {
+// Only the fields the website renders — the raw catalogue is ~4.7 MB.
+function mapScheme(item) {
   const fields = item.fields || {};
   const slug = fields.slug || slugify(fields.schemeName || item.id);
   const categories = Array.isArray(fields.schemeCategory) ? fields.schemeCategory : [];
   const states = Array.isArray(fields.beneficiaryState) ? fields.beneficiaryState : [];
-  const level = fields.level === 'State' ? 'state' : 'central';
+  const tags = Array.isArray(fields.tags) ? fields.tags : [];
+  const closeDate = toIsoDate(fields.schemeCloseDate);
 
   return {
     id: `myscheme-${slug}`,
     slug,
     name: fields.schemeName || fields.schemeShortTitle || slug,
+    short_title: fields.schemeShortTitle || undefined,
     description: fields.briefDescription || 'Details available on myScheme.',
-    ministry: fields.nodalMinistryName || 'Government of India',
-    type: level,
+    ministry:
+      fields.nodalMinistryName ||
+      (fields.level === 'State' && states.length === 1 && states[0] !== 'All'
+        ? `Government of ${states[0]}`
+        : 'Government of India'),
+    type: fields.level === 'State' ? 'state' : 'central',
     state: states.filter((state) => state !== 'All').join(', ') || undefined,
-    benefits: fields.tags?.slice(0, 4).join(', ') || 'See official scheme details',
-    eligibility_criteria: {
-      states: states.length ? states : undefined,
-      gender: 'any',
-    },
+    benefits: '',
+    tags,
+    eligibility_criteria: { states: states.length ? states : undefined, gender: 'any' },
     documents_required: [],
-    status: fields.schemeCloseDate ? 'closed' : 'active',
-    deadline: fields.schemeCloseDate || undefined,
+    // A close date only means "closed" once it has actually passed.
+    status: isPastDate(closeDate) ? 'closed' : 'active',
+    deadline: closeDate || undefined,
     application_url: `https://www.myscheme.gov.in/schemes/${slug}`,
     scheme_categories: categories,
+    scheme_for: fields.schemeFor || undefined,
     source: 'myScheme',
-    source_url: 'https://www.myscheme.gov.in/',
-    is_new: false,
-    first_seen_at: now,
-    last_seen_at: now,
-    created_at: now,
-    updated_at: now,
   };
 }
 
-async function fetchPage(from) {
-  const url = new URL(SEARCH_URL);
-  url.searchParams.set('lang', 'en');
-  url.searchParams.set('q', '');
-  url.searchParams.set('keyword', '');
-  url.searchParams.set('sort', 'multiple_sort');
-  url.searchParams.set('from', String(from));
-  url.searchParams.set('size', String(PAGE_SIZE));
-
-  const response = await fetch(url, { headers });
-  if (!response.ok) {
-    throw new Error(`myScheme request failed: ${response.status} ${response.statusText}`);
-  }
-
-  const data = await response.json();
-  if (data.statusCode !== 200 || !data.data?.hits?.items) {
-    throw new Error(`Unexpected myScheme response: ${JSON.stringify(data).slice(0, 300)}`);
-  }
-
-  return data.data;
-}
-
 export default async function handler(req, res) {
+  if (!rateLimit(req, res, { route: 'schemes', limit: 10, windowMs: 60000 })) return;
   try {
-    const now = new Date().toISOString();
+    const { total, items } = await fetchAllMySchemeItems();
+    const schemes = items.map(mapScheme);
 
-    const firstPage = await fetchPage(0);
-    const total = firstPage.hits.page.total;
-    const facets = firstPage.facets || [];
-    const schemes = firstPage.hits.items.map((item) => mapScheme(item, now));
-
-    const offsets = [];
-    for (let from = PAGE_SIZE; from < total; from += PAGE_SIZE) offsets.push(from);
-    for (let i = 0; i < offsets.length; i += PARALLEL_PAGES) {
-      const batch = offsets.slice(i, i + PARALLEL_PAGES);
-      const pages = await Promise.all(batch.map((from) => fetchPage(from)));
-      for (const page of pages) {
-        schemes.push(...page.hits.items.map((item) => mapScheme(item, now)));
-      }
-    }
-
-    // Cache at the edge so myScheme is only hit once a day, not per visitor.
-    res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate=86400');
+    res.setHeader('Cache-Control', dailyCacheHeader());
     return res.status(200).json({
       meta: {
         source: 'myScheme',
         source_url: 'https://www.myscheme.gov.in/',
-        updated_at: now,
+        updated_at: new Date().toISOString(),
         total,
         fetched: schemes.length,
         new_count: 0,
       },
-      facets,
       schemes,
     });
   } catch (error) {
     // The frontend falls back to the committed static snapshot on any error.
+    res.setHeader('Cache-Control', 'no-store');
     return res.status(502).json({
       meta: { source: 'Live Fail', updated_at: new Date().toISOString() },
       schemes: [],

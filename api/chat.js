@@ -1,39 +1,17 @@
+// Ask DhanSathi chat endpoint — self-hosted Gemma 4 E4B only.
+// Accepts OpenAI-style { messages } and returns an OpenAI-style chat
+// completion, so the frontend parser stays simple. If Gemma is unreachable,
+// a short rule-based answer is returned instead of an error.
+
+import { callGemma, messagesToPrompt } from './_lib/gemma.js';
+import { rateLimit } from './_lib/ratelimit.js';
+
 export const config = {
-  maxDuration: 30,
+  maxDuration: 60,
 };
 
-const NVIDIA_CHAT_URL = 'https://integrate.api.nvidia.com/v1/chat/completions';
-const PRIMARY_CHAT_MODEL = 'z-ai/glm-5.1';
-const FAST_CHAT_FALLBACKS = ['google/gemma-4-31b-it'];
-
-function withGlmThinking(body) {
-  if (body.model !== PRIMARY_CHAT_MODEL) return body;
-
-  return {
-    ...body,
-    extra_body: {
-      ...(body.extra_body || {}),
-      chat_template_kwargs: {
-        ...(body.extra_body?.chat_template_kwargs || {}),
-        enable_thinking: true,
-        clear_thinking: false,
-      },
-    },
-  };
-}
-
-function makeAttempts(requestBody) {
-  const requestedModel = requestBody.model || PRIMARY_CHAT_MODEL;
-  const models = [
-    requestedModel,
-    ...FAST_CHAT_FALLBACKS.filter((model) => model !== requestedModel),
-  ];
-
-  return models.map((model, index) => ({
-    model,
-    timeoutMs: index === 0 && model === PRIMARY_CHAT_MODEL ? 3500 : 4500,
-  }));
-}
+const GEMMA_MODEL_LABEL = 'gemma-4-e4b-selfhosted';
+const GEMMA_TIMEOUT_MS = 55000;
 
 function getLastUserMessage(messages = []) {
   const last = [...messages].reverse().find((message) => message?.role === 'user');
@@ -142,31 +120,36 @@ function sendServerFallback(res, messages, failures) {
   });
 }
 
-async function callNvidiaChat(apiKey, requestBody, attempt) {
-  const body = withGlmThinking({
-    ...requestBody,
-    model: attempt.model,
-    stream: false,
+function wantsJson(body) {
+  if (body.response_format?.type === 'json_object') return true;
+  const system = (body.messages || []).find((message) => message.role === 'system');
+  return /only valid json/i.test(String(system?.content || ''));
+}
+
+// Gemma's reply wrapped in the OpenAI chat-completion shape the frontend parses.
+async function callGemmaChat(body) {
+  const text = await callGemma(messagesToPrompt(body.messages), {
+    json: wantsJson(body),
+    timeoutMs: GEMMA_TIMEOUT_MS,
   });
-
-  const upstream = await fetch(NVIDIA_CHAT_URL, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(attempt.timeoutMs),
-  });
-
-  const contentType = upstream.headers.get('content-type') || 'application/json';
-  const payload = Buffer.from(await upstream.arrayBuffer());
-
+  const payload = {
+    id: `gemma-${Date.now()}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: GEMMA_MODEL_LABEL,
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: text, reasoning_content: '' },
+        finish_reason: 'stop',
+      },
+    ],
+  };
   return {
-    ok: upstream.ok,
-    status: upstream.status,
-    contentType,
-    payload,
+    ok: true,
+    status: 200,
+    contentType: 'application/json',
+    payload: Buffer.from(JSON.stringify(payload)),
   };
 }
 
@@ -177,54 +160,16 @@ export default async function handler(req, res) {
     return;
   }
 
-  const apiKey = process.env.NVIDIA_API_KEY || process.env.VITE_NVIDIA_API_KEY;
+  if (!rateLimit(req, res, { route: 'chat', limit: 20, windowMs: 60000 })) return;
 
-  if (!apiKey) {
-    sendServerFallback(res, req.body?.messages || [], ['NVIDIA_API_KEY is not configured on the server.']);
-    return;
-  }
-
+  const body = { ...(req.body || {}) };
   try {
-    const body = { ...(req.body || {}) };
-    const attempts = makeAttempts(body);
-    const results = await Promise.allSettled(
-      attempts.map(async (attempt) => {
-        try {
-          return {
-            attempt,
-            upstream: await callNvidiaChat(apiKey, body, attempt),
-          };
-        } catch (error) {
-          const message = error instanceof Error ? error.message : 'unknown error';
-          throw new Error(`${attempt.model}: ${message}`);
-        }
-      }),
-    );
-    const failures = [];
-
-    for (const result of results) {
-      if (result.status === 'rejected') {
-        const message = result.reason instanceof Error ? result.reason.message : 'unknown error';
-        failures.push(message);
-        continue;
-      }
-
-      const { attempt, upstream } = result.value;
-      if (!upstream.ok) {
-        failures.push(`${attempt.model}: HTTP ${upstream.status} ${upstream.payload.toString('utf8').slice(0, 160)}`);
-        continue;
-      }
-
-      res.status(200);
-      res.setHeader('content-type', upstream.contentType);
-      res.setHeader('x-dhansathi-model-used', attempt.model);
-      res.send(upstream.payload);
-      return;
-    }
-
-    sendServerFallback(res, body.messages || [], failures);
+    const upstream = await callGemmaChat(body);
+    res.status(200);
+    res.setHeader('content-type', upstream.contentType);
+    res.setHeader('x-dhansathi-model-used', GEMMA_MODEL_LABEL);
+    res.send(upstream.payload);
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'NVIDIA chat proxy failed';
-    res.status(502).json({ error: message });
+    sendServerFallback(res, body.messages || [], [error instanceof Error ? error.message : String(error)]);
   }
 }
