@@ -157,12 +157,6 @@ export default function AdminLogin() {
                 {loading ? 'Signing in...' : 'Sign in'}
               </button>
             </div>
-
-            <div className="mt-4 text-center">
-              <p className="text-xs text-gray-500">
-                Admin: admin@dhansathi.com / admin123
-              </p>
-            </div>
           </form>
         </div>
       </motion.div>
