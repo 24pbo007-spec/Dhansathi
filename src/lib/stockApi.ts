@@ -150,6 +150,20 @@ function setCache<T>(key: string, data: T): void {
   _stockCache.set(key, { data, timestamp: Date.now() });
 }
 
+// Requests already in flight, keyed like the cache. Pages call
+// fetchLiveStocks() and getMarketOverview() together, and getMarketOverview()
+// calls fetchLiveStocks() itself — without this, every chart was downloaded
+// two or three times on each visit.
+const _inFlight = new Map<string, Promise<unknown>>();
+
+function dedupe<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const existing = _inFlight.get(key);
+  if (existing) return existing as Promise<T>;
+  const promise = run().finally(() => _inFlight.delete(key));
+  _inFlight.set(key, promise);
+  return promise;
+}
+
 // ─── Technical Indicator Calculations ────────────────────────────────────────
 
 /**
@@ -709,7 +723,11 @@ async function withLiveFundamentals(stocks: StockData[]): Promise<StockData[]> {
   });
 }
 
-export async function fetchLiveStocks(): Promise<StockData[]> {
+export function fetchLiveStocks(): Promise<StockData[]> {
+  return dedupe('all_nifty50', fetchLiveStocksUncached);
+}
+
+async function fetchLiveStocksUncached(): Promise<StockData[]> {
   const cacheKey = 'all_nifty50';
   const cached = getCached<StockData[]>(cacheKey);
   if (cached) {
@@ -1079,7 +1097,11 @@ export async function searchAndFetchStocks(query: string): Promise<StockData[]> 
   return results.filter((s): s is StockData => s !== null);
 }
 
-export async function getMarketOverview(): Promise<MarketOverview> {
+export function getMarketOverview(): Promise<MarketOverview> {
+  return dedupe('market_overview', getMarketOverviewUncached);
+}
+
+async function getMarketOverviewUncached(): Promise<MarketOverview> {
   const cacheKey = 'market_overview';
   const cached = getCached<MarketOverview>(cacheKey);
   if (cached) return cached;
