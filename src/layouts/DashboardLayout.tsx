@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import { Outlet, NavLink, useLocation } from 'react-router-dom';
+import { prefetchDashboardPages } from '@/routes/dashboardLoaders';
 import { cn } from '@/lib/utils';
 import { useLanguageStore } from '@/stores/languageStore';
 import { useAuthStore } from '@/stores/authStore';
@@ -30,9 +31,29 @@ const NAV_ITEMS: NavItem[] = [
   { labelKey: 'applicationTracker', icon: 'check_circle', path: '/dashboard/applications', sectionKey: 'proTools' },
 ];
 
+/** Shown in the content area only (the sidebar stays put) while a page's code loads. */
+function ContentLoader() {
+  return (
+    <div className="space-y-4 animate-pulse" aria-busy="true" aria-label="Loading">
+      <div className="h-9 w-64 rounded-xl bg-surface-container-high" />
+      <div className="h-4 w-96 max-w-full rounded-lg bg-surface-container-high" />
+      <div className="grid grid-cols-1 gap-4 pt-4 md:grid-cols-3">
+        {[0, 1, 2].map((i) => (
+          <div key={i} className="h-36 rounded-2xl bg-surface-container-high" />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function DashboardLayout() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const location = useLocation();
+
+  // Download every dashboard page in the background so sidebar clicks are instant.
+  useEffect(() => {
+    prefetchDashboardPages();
+  }, []);
   const { lang, toggleLang } = useLanguageStore();
   const user = useAuthStore((s) => s.user);
 
@@ -224,7 +245,9 @@ export default function DashboardLayout() {
       {/* Main content */}
       <main className="md:ml-[250px] min-h-screen pt-16 md:pt-0">
         <div className="p-4 md:p-12 pb-24 md:pb-12">
-          <Outlet />
+          <Suspense fallback={<ContentLoader />}>
+            <Outlet />
+          </Suspense>
         </div>
       </main>
 
