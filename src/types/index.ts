@@ -84,14 +84,17 @@ export interface GovernmentScheme {
   status: SchemeStatus;
   deadline?: string;
   scheme_categories?: string[];
+  tags?: string[];
+  short_title?: string;
+  scheme_for?: string;
   source?: string;
   source_url?: string;
   slug?: string;
   is_new?: boolean;
   first_seen_at?: string;
   last_seen_at?: string;
-  created_at: string;
-  updated_at: string;
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface SchemeMatch {

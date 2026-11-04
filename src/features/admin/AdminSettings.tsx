@@ -33,7 +33,7 @@ const API_KEY_DEFS: ApiKeyConfig[] = [
   { id: 'supabase_url', label: 'Supabase URL', envKey: 'VITE_SUPABASE_URL', icon: 'database' },
   { id: 'supabase_key', label: 'Supabase Anon Key', envKey: 'VITE_SUPABASE_ANON_KEY', icon: 'vpn_key' },
   { id: 'twelve_data', label: 'Twelve Data API Key', envKey: 'VITE_TWELVE_DATA_KEY', icon: 'trending_up' },
-  { id: 'nvidia', label: 'NVIDIA AI Key', envKey: 'VITE_NVIDIA_API_KEY', icon: 'bolt' },
+  { id: 'gemma', label: 'AI Model', envKey: 'GEMMA_AI_URL', icon: 'bolt' },
   { id: 'razorpay', label: 'Razorpay Key', envKey: 'VITE_RAZORPAY_KEY', icon: 'credit_card' },
 ];
 
@@ -105,8 +105,8 @@ function saveToStorage<T>(key: string, value: T) {
 }
 
 function getEnvValue(envKey: string): string {
-  if (envKey === 'VITE_NVIDIA_API_KEY') {
-    return 'Configured on Vercel server';
+  if (envKey === 'GEMMA_AI_URL') {
+    return 'Self-hosted Gemma 4 E4B (server-side, no key needed)';
   }
 
   const val = {

@@ -1,32 +1,24 @@
 import { EXPLICIT_STATE_SCHEMES } from '../scripts/state_portals.js';
+import { dailyCacheHeader, fetchAllMySchemeItems, isPastDate, toIsoDate } from './_lib/myscheme.js';
+import { rateLimit } from './_lib/ratelimit.js';
 
 // Fetching NSP + all of myScheme's education schemes takes several seconds.
 export const config = { maxDuration: 60 };
 
-// myScheme is India's official scheme catalogue; its education/scholarship
-// schemes are pulled in alongside NSP to widen coverage. The API key is the
-// public x-api-key that myscheme.gov.in ships to every browser (not a secret);
-// an env var of the same name overrides it if myScheme ever rotates the key.
-const MYSCHEME_API_KEY =
-  process.env.MYSCHEME_API_KEY || 'tYTy5eEhlu9rFjyxuCr7ra7ACp4dv1RH8gWuHTDc';
-const MYSCHEME_SEARCH_URL = 'https://api.myscheme.gov.in/search/v6/schemes';
-const MYSCHEME_PAGE_SIZE = 100;
-const MYSCHEME_PARALLEL = 10;
+// Words that on their own mark a scheme as student financial support.
+const STRONG_SCHOLARSHIP_TERMS =
+  /scholarship|fellowship|stipend|pre[-\s]?matric|post[-\s]?matric|tuition|fee\s*(reimburse|waiver|concession)|merit\s*(award|incentive|cum)|education\s*loan|study\s*loan|vidya|shiksha|siksha/i;
+// Words that count only when myScheme files the scheme under education.
+const EDUCATION_SUPPORT_TERMS =
+  /\bstudents?\b|ph\.?\s?d|research|coaching|hostel|award|incentive|financial assistance|cash|laptop|tablet|bicycle|cycle|loan|abroad|overseas/i;
 
-const mySchemeHeaders = {
-  origin: 'https://www.myscheme.gov.in',
-  referer: 'https://www.myscheme.gov.in/',
-  'user-agent': 'Mozilla/5.0 (DhanSathi scholarship updater)',
-  'x-api-key': MYSCHEME_API_KEY,
-};
-
-// Keep only education/scholarship-flavoured schemes out of the full catalogue.
+// Keep student financial-support schemes out of myScheme's full catalogue.
+// Filing under "Education & Learning" alone is not enough: that category also
+// holds school buildings, children's homes and teacher programmes.
 function isScholarshipScheme(text, categories) {
-  const cat = categories.join(' ').toLowerCase();
-  if (cat.includes('education') || cat.includes('learning')) return true;
-  return /scholarship|fellowship|scholar|vidya|vidhya|shiksha|siksha|merit|tuition|pre[-\s]?matric|post[-\s]?matric|fee\s*reimburse|\bstudent|\beducation/i.test(
-    text,
-  );
+  if (STRONG_SCHOLARSHIP_TERMS.test(text)) return true;
+  const isEducation = categories.some((cat) => /education|learning/i.test(cat));
+  return isEducation && EDUCATION_SUPPORT_TERMS.test(text);
 }
 
 function decodeHtml(value = '') {
@@ -41,20 +33,8 @@ function decodeHtml(value = '') {
     .trim();
 }
 
-function parseIndianDate(value) {
-  const match = String(value || '').match(/(\d{2})-(\d{2})-(\d{4})/);
-  if (!match) return null;
-  const [, dd, mm, yyyy] = match;
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function isExpired(dateIso) {
-  if (!dateIso) return false;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const date = new Date(`${dateIso}T23:59:59+05:30`);
-  return date < today;
-}
+const parseIndianDate = toIsoDate;
+const isExpired = isPastDate;
 
 function inferLevels(name) {
   const text = name.toLowerCase();
@@ -243,8 +223,10 @@ function parseNspScholarships(html, sourceUrl) {
         department,
         education_levels: inferLevels(name),
         target_groups: inferTargetGroups(name, department),
-        benefits: 'See official specifications for benefit amount and rules',
-        eligibility: 'Eligibility is defined by the live scheme specifications.',
+        // NSP's listing page carries no benefit text; the scheme's
+        // specification PDF (specifications_url) is the authoritative source.
+        benefits: '',
+        eligibility: `Listed on the National Scholarship Portal under ${department}. Open the official specification for amount, eligibility and documents.`,
         documents_required: ['Aadhaar', 'Income/category certificate if applicable', 'Previous marksheet', 'Bank account', 'Institution verification'],
         application_url: 'https://scholarships.gov.in/',
         portal: 'National Scholarship Portal',
@@ -341,24 +323,6 @@ async function fetchWithTimeout(url, options = {}) {
   }
 }
 
-async function fetchMySchemePage(from) {
-  const url = new URL(MYSCHEME_SEARCH_URL);
-  url.searchParams.set('lang', 'en');
-  url.searchParams.set('q', '');
-  url.searchParams.set('keyword', '');
-  url.searchParams.set('sort', 'multiple_sort');
-  url.searchParams.set('from', String(from));
-  url.searchParams.set('size', String(MYSCHEME_PAGE_SIZE));
-
-  const response = await fetch(url, { headers: mySchemeHeaders });
-  if (!response.ok) throw new Error(`myScheme request failed: ${response.status}`);
-  const data = await response.json();
-  if (data.statusCode !== 200 || !data.data?.hits?.items) {
-    throw new Error('Unexpected myScheme response');
-  }
-  return data.data;
-}
-
 function mapMySchemeScholarship(item) {
   const fields = item.fields || {};
   const name = fields.schemeName || fields.schemeShortTitle || 'Scholarship';
@@ -369,7 +333,7 @@ function mapMySchemeScholarship(item) {
   const context = `${name} ${fields.briefDescription || ''} ${tags.join(' ')} ${categories.join(' ')} ${fields.nodalMinistryName || ''}`;
   const provider = fields.level === 'State' ? 'state' : 'central';
   const stateName = states.filter((s) => s && s !== 'All').join(', ') || null;
-  const closeDate = fields.schemeCloseDate ? parseIndianDate(fields.schemeCloseDate) : null;
+  const closeDate = toIsoDate(fields.schemeCloseDate);
 
   return {
     id: `myscheme-${slug}`,
@@ -378,7 +342,11 @@ function mapMySchemeScholarship(item) {
     department: fields.nodalMinistryName || 'Government of India',
     education_levels: inferLevels(context),
     target_groups: inferTargetGroups(name, context),
-    benefits: tags.slice(0, 4).join(', ') || 'See official scheme details on myScheme',
+    // myScheme's search API has no benefit text; the card loads it on demand
+    // from /api/scheme-detail using myscheme_slug.
+    benefits: '',
+    tags,
+    myscheme_slug: slug,
     eligibility: fields.briefDescription || 'Eligibility is defined by the official myScheme scheme page.',
     documents_required: ['Aadhaar', 'Income/category certificate if applicable', 'Previous marksheet', 'Bank account'],
     application_url: `https://www.myscheme.gov.in/schemes/${slug}`,
@@ -389,23 +357,14 @@ function mapMySchemeScholarship(item) {
     studentApplicationCloseDate: closeDate || undefined,
     status: closeDate && isExpired(closeDate) ? 'expired' : 'open',
     state: stateName,
+    states: states.filter((s) => s && s !== 'All'),
     university: null,
     programs: inferPrograms(name, context),
   };
 }
 
 async function fetchMySchemeScholarships() {
-  const first = await fetchMySchemePage(0);
-  const total = first.hits.page.total;
-  const items = [...first.hits.items];
-
-  const offsets = [];
-  for (let from = MYSCHEME_PAGE_SIZE; from < total; from += MYSCHEME_PAGE_SIZE) offsets.push(from);
-  for (let i = 0; i < offsets.length; i += MYSCHEME_PARALLEL) {
-    const batch = offsets.slice(i, i + MYSCHEME_PARALLEL);
-    const pages = await Promise.all(batch.map((from) => fetchMySchemePage(from)));
-    for (const page of pages) items.push(...page.hits.items);
-  }
+  const { items } = await fetchAllMySchemeItems();
 
   return items
     .filter((item) => {
@@ -419,6 +378,7 @@ async function fetchMySchemeScholarships() {
 }
 
 export default async function handler(req, res) {
+  if (!rateLimit(req, res, { route: 'scholarships', limit: 10, windowMs: 60000 })) return;
   const includeExpired = req.query?.includeExpired === 'true';
 
   try {
@@ -486,7 +446,7 @@ export default async function handler(req, res) {
       allScholarships = allScholarships.filter((s) => s.status === 'open');
     }
 
-    res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate=86400');
+    res.setHeader('Cache-Control', dailyCacheHeader());
     return res.status(200).json({
       meta: {
         source: 'Live feed (NSP + myScheme + Hybrid State Generators)',

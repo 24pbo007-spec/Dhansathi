@@ -5,6 +5,8 @@ import { cn } from '@/lib/utils';
 import { CustomSelect } from '@/components/shared/CustomSelect';
 import { useAuthStore } from '@/stores/authStore';
 import { useApplicationStore } from '@/stores/useApplicationStore';
+import { SchemeDetailModal } from '@/components/shared/SchemeDetailModal';
+import { INDIA_STATES_AND_UTS, canonicalState, stateFromSlug, stateKey } from '@/lib/indiaStates';
 
 type ScholarshipLevel =
   | 'school'
@@ -40,8 +42,11 @@ export interface LiveScholarship {
   deadline_hint: string;
   status: 'open' | 'expired';
   state?: string;
+  states?: string[];
   university?: string;
   programs?: string[];
+  tags?: string[];
+  myscheme_slug?: string;
 }
 
 interface ScholarshipFeed {
@@ -90,8 +95,21 @@ function providerTag(provider: ScholarshipProvider): { label: string; cls: strin
   return { label: 'Public Sector', cls: 'bg-secondary-fixed text-secondary' };
 }
 
-function todayKey() {
-  return new Date().toISOString().slice(0, 10);
+const PAGE_SIZE = 24;
+const CLOSING_SOON_DAYS = 30;
+
+function daysUntil(isoDate: string) {
+  return Math.ceil((new Date(`${isoDate}T23:59:59+05:30`).getTime() - Date.now()) / 86400000);
+}
+
+/** State-specific scholarships for the state, plus every all-India one. */
+function servesState(scholarship: LiveScholarship, state: string) {
+  const key = stateKey(state);
+  const states = scholarship.states?.length
+    ? scholarship.states
+    : (scholarship.state || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (!states.length) return scholarship.provider !== 'state';
+  return states.some((s) => stateKey(s) === key);
 }
 
 function scholarshipMatchesSearch(scholarship: LiveScholarship, query: string) {
@@ -133,10 +151,7 @@ export default function ScholarshipsPage() {
   const [activeLevel, setActiveLevel] = useState<LevelFilter>('all');
   const [activeProvider, setActiveProvider] = useState<ProviderFilter>('all');
   
-  const initialUrlState = useMemo(() => {
-    if (!stateParam) return 'all';
-    return stateParam.split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()).join(' ');
-  }, [stateParam]);
+  const initialUrlState = useMemo(() => stateFromSlug(stateParam) ?? 'all', [stateParam]);
 
   const [activeState, setActiveState] = useState<string>(initialUrlState);
   const [activeUniversity, setActiveUniversity] = useState<string>('all');
@@ -146,18 +161,30 @@ export default function ScholarshipsPage() {
   const [feed, setFeed] = useState<ScholarshipFeed | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const [closingSoonOnly, setClosingSoonOnly] = useState(false);
+  const [selected, setSelected] = useState<LiveScholarship | null>(null);
+
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE);
+  }, [activeLevel, activeProvider, activeState, activeUniversity, activeProgram, activeCategory, closingSoonOnly, search]);
 
   useEffect(() => {
     let mounted = true;
-    const day = new Date().toISOString().split('T')[0];
-    const cacheKey = `dhansathi-live-scholarships-v5:${day}`;
+    const day = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+    const cacheKey = `dhansathi-live-scholarships-v6:${day}`;
 
     async function loadScholarships() {
       setLoading(true);
       setError(null);
 
       try {
-        const cached = localStorage.getItem(cacheKey);
+        let cached: string | null = null;
+        try {
+          cached = localStorage.getItem(cacheKey);
+        } catch {
+          // storage blocked (private mode) — fetch instead
+        }
         if (cached) {
           const parsed = JSON.parse(cached) as ScholarshipFeed;
           if (mounted) setFeed(parsed);
@@ -178,15 +205,17 @@ export default function ScholarshipsPage() {
         const nextFeed = (await response.json()) as ScholarshipFeed;
         if (nextFeed.error) throw new Error(nextFeed.error);
 
-        localStorage.setItem(cacheKey, JSON.stringify(nextFeed));
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          if (key && key.startsWith('dhansathi-live-scholarships') && key !== cacheKey) {
-            localStorage.removeItem(key);
-          }
-        }
-
         if (mounted) setFeed(nextFeed);
+
+        // The feed is ~1.5 MB; caching is a bonus, never a reason to fail.
+        try {
+          Object.keys(localStorage)
+            .filter((key) => key.startsWith('dhansathi-live-scholarships') && key !== cacheKey)
+            .forEach((key) => localStorage.removeItem(key));
+          localStorage.setItem(cacheKey, JSON.stringify(nextFeed));
+        } catch {
+          // QuotaExceededError or storage disabled — the page already has data.
+        }
       } catch (err) {
         if (mounted) {
           setError(err instanceof Error ? err.message : 'Unable to load live scholarship data.');
@@ -204,12 +233,22 @@ export default function ScholarshipsPage() {
     };
   }, []);
 
-  const scholarships = feed?.scholarships || [];
+  const scholarships = useMemo(() => feed?.scholarships || [], [feed]);
 
-  const uniqueStates = useMemo(() => {
-    const states = new Set<string>();
-    scholarships.forEach(s => s.state && states.add(s.state));
-    return Array.from(states).sort();
+  const stateCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const scholarship of scholarships) {
+      const names = scholarship.states?.length ? scholarship.states : (scholarship.state || '').split(',');
+      const seen = new Set<string>();
+      for (const name of names) {
+        const canonical = canonicalState(name.trim());
+        if (canonical && !seen.has(canonical)) {
+          seen.add(canonical);
+          counts.set(canonical, (counts.get(canonical) || 0) + 1);
+        }
+      }
+    }
+    return counts;
   }, [scholarships]);
 
   const uniqueUniversities = useMemo(() => {
@@ -234,14 +273,27 @@ export default function ScholarshipsPage() {
     return scholarships.filter((scholarship) => {
       const levelMatch = activeLevel === 'all' || scholarship.education_levels.includes(activeLevel);
       const providerMatch = activeProvider === 'all' || scholarship.provider === activeProvider;
-      const stateMatch = activeState === 'all' || scholarship.state === activeState;
+      const stateMatch = activeState === 'all' || servesState(scholarship, activeState);
+      const closingMatch =
+        !closingSoonOnly ||
+        (!!scholarship.studentApplicationCloseDate && daysUntil(scholarship.studentApplicationCloseDate) <= CLOSING_SOON_DAYS);
       const universityMatch = activeUniversity === 'all' || scholarship.university === activeUniversity;
       const programMatch = activeProgram === 'all' || (scholarship.programs && scholarship.programs.includes(activeProgram));
       const categoryMatch = activeCategory === 'all' || (scholarship.target_groups && scholarship.target_groups.includes(activeCategory));
 
-      return levelMatch && providerMatch && stateMatch && universityMatch && programMatch && categoryMatch && scholarshipMatchesSearch(scholarship, search);
+      return levelMatch && providerMatch && stateMatch && closingMatch && universityMatch && programMatch && categoryMatch && scholarshipMatchesSearch(scholarship, search);
+    }).sort((a, b) => {
+      // Nearest deadline first so time-sensitive scholarships are never buried.
+      const da = a.studentApplicationCloseDate || '9999';
+      const db = b.studentApplicationCloseDate || '9999';
+      return da.localeCompare(db);
     });
-  }, [activeLevel, activeProvider, activeState, activeUniversity, activeProgram, activeCategory, scholarships, search]);
+  }, [activeLevel, activeProvider, activeState, closingSoonOnly, activeUniversity, activeProgram, activeCategory, scholarships, search]);
+
+  const closingSoonCount = useMemo(
+    () => scholarships.filter((s) => s.studentApplicationCloseDate && daysUntil(s.studentApplicationCloseDate) <= CLOSING_SOON_DAYS).length,
+    [scholarships],
+  );
 
   const levelCounts = useMemo(() => {
     return LEVEL_FILTERS.reduce<Record<string, number>>((acc, filter) => {
@@ -282,7 +334,7 @@ export default function ScholarshipsPage() {
             </span>
           </p>
         </div>
-        <div className="grid grid-cols-3 gap-3 lg:min-w-[360px]">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 lg:min-w-[480px]">
           <div className="rounded-2xl bg-surface-container-lowest border border-outline-variant/20 p-4 text-center">
             <p className="font-mono font-bold text-2xl text-primary">{scholarships.length}</p>
             <p className="text-[10px] text-on-surface-variant uppercase tracking-wider font-semibold">Open Now</p>
@@ -293,8 +345,18 @@ export default function ScholarshipsPage() {
           </div>
           <div className="rounded-2xl bg-surface-container-lowest border border-outline-variant/20 p-4 text-center">
             <p className="font-mono font-bold text-2xl text-secondary">{stateCount + publicSectorCount}</p>
-            <p className="text-[10px] text-on-surface-variant uppercase tracking-wider font-semibold">Other</p>
+            <p className="text-[10px] text-on-surface-variant uppercase tracking-wider font-semibold">State / Other</p>
           </div>
+          <button
+            onClick={() => setClosingSoonOnly((v) => !v)}
+            className={cn(
+              'rounded-2xl border p-4 text-center transition-colors',
+              closingSoonOnly ? 'bg-error text-white border-error' : 'bg-surface-container-lowest border-outline-variant/20 hover:border-error/40',
+            )}
+          >
+            <p className={cn('font-mono font-bold text-2xl', closingSoonOnly ? 'text-white' : 'text-error')}>{closingSoonCount}</p>
+            <p className={cn('text-[10px] uppercase tracking-wider font-semibold', closingSoonOnly ? 'text-white' : 'text-on-surface-variant')}>Closing in 30d</p>
+          </button>
         </div>
       </div>
 
@@ -420,8 +482,11 @@ export default function ScholarshipsPage() {
               value={activeState}
               onChange={setActiveState}
               options={[
-                { value: 'all', label: 'All States' },
-                ...uniqueStates.map(state => ({ value: state, label: state }))
+                { value: 'all', label: 'All India (every state)' },
+                ...INDIA_STATES_AND_UTS.map(state => ({
+                  value: state,
+                  label: `${state}${stateCounts.get(state) ? ` (${stateCounts.get(state)})` : ''}`,
+                }))
               ]}
             />
 
@@ -472,209 +537,155 @@ export default function ScholarshipsPage() {
           <p className="text-on-surface-variant font-medium">No open scholarships match your filters.</p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-5">
-          {filteredScholarships.map((scholarship) => {
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
+          {filteredScholarships.slice(0, visibleCount).map((scholarship) => {
             const tag = providerTag(scholarship.provider);
             const closeDate = formatDate(scholarship.studentApplicationCloseDate);
+            const daysLeft = scholarship.studentApplicationCloseDate ? daysUntil(scholarship.studentApplicationCloseDate) : null;
             const isTracked = !!applications[scholarship.id];
+            const applyUrl = scholarship.specifications_url || scholarship.application_url;
 
             const requiredCount = scholarship.documents_required?.length || 0;
             let readyCount = requiredCount;
             if (user) {
-              const missingDocuments: string[] = [];
-              const reqDocs = scholarship.documents_required || [];
-              if (reqDocs.some(d => d.toLowerCase().includes('income')) && !user.has_income_certificate) {
-                missingDocuments.push('Income Certificate');
-              }
-              if (reqDocs.some(d => d.toLowerCase().includes('caste') || d.toLowerCase().includes('category')) && !user.has_caste_certificate && user.category !== 'general') {
-                missingDocuments.push('Caste Certificate');
-              }
-              if (reqDocs.some(d => d.toLowerCase().includes('domicile') || d.toLowerCase().includes('resident')) && !user.has_domicile_certificate) {
-                missingDocuments.push('Domicile Certificate');
-              }
-              if (reqDocs.some(d => d.toLowerCase().includes('bank') && d.toLowerCase().includes('aadhaar')) && !user.is_aadhaar_bank_linked) {
-                missingDocuments.push('Aadhaar Seeded Bank Account');
-              }
-              readyCount = Math.max(0, requiredCount - missingDocuments.length);
+              const reqDocs = (scholarship.documents_required || []).map((d) => d.toLowerCase());
+              let missing = 0;
+              if (reqDocs.some((d) => d.includes('income')) && !user.has_income_certificate) missing += 1;
+              if (reqDocs.some((d) => d.includes('caste') || d.includes('category')) && !user.has_caste_certificate && user.category !== 'general') missing += 1;
+              if (reqDocs.some((d) => d.includes('domicile') || d.includes('resident')) && !user.has_domicile_certificate) missing += 1;
+              if (reqDocs.some((d) => d.includes('bank') && d.includes('aadhaar')) && !user.is_aadhaar_bank_linked) missing += 1;
+              readyCount = Math.max(0, requiredCount - missing);
             }
             const docReadinessPct = requiredCount > 0 ? Math.round((readyCount / requiredCount) * 100) : 100;
 
             return (
               <article
                 key={scholarship.id}
-                className="bg-surface-container-lowest rounded-2xl p-5 shadow-ambient flex flex-col transition-transform hover:-translate-y-0.5"
+                className="bg-surface-container-lowest rounded-2xl p-5 shadow-ambient border border-transparent hover:border-primary/30 flex flex-col transition-all hover:-translate-y-0.5"
               >
-                <div className="flex items-start justify-between gap-3 mb-3">
-                  <div className="min-w-0">
-                    <h2 className="font-headline font-bold text-on-surface text-base leading-snug">
-                      {scholarship.name}
-                    </h2>
-                    <p className="text-on-surface-variant text-xs mt-1">{scholarship.department}</p>
-                  </div>
-                  <div className="shrink-0 w-11 h-11 rounded-full bg-primary-fixed flex items-center justify-center">
+                <div className="flex items-start gap-3 mb-3">
+                  <div className="shrink-0 w-11 h-11 rounded-xl bg-primary-fixed flex items-center justify-center">
                     <span className="material-symbols-outlined text-primary">school</span>
                   </div>
+                  <div className="min-w-0 flex-1">
+                    <h2 className="font-headline font-bold text-on-surface text-[15px] leading-snug line-clamp-2">{scholarship.name}</h2>
+                    <p className="text-on-surface-variant text-[11px] mt-0.5 truncate">{scholarship.department}</p>
+                  </div>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2 mb-3">
-                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md ${tag.cls}`}>
-                    {tag.label}
-                  </span>
-                  <span className="text-[10px] font-medium text-on-surface-variant bg-surface-container-high px-2 py-0.5 rounded-md">
-                    {scholarship.portal}
-                  </span>
-                  <span className="text-[10px] font-bold text-tertiary bg-tertiary-fixed px-2 py-0.5 rounded-md">
-                    Open
-                  </span>
+                <div className="flex flex-wrap items-center gap-1.5 mb-3">
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md ${tag.cls}`}>{tag.label}</span>
+                  <span className="text-[10px] font-medium text-on-surface-variant bg-surface-container-high px-2 py-0.5 rounded-md">{scholarship.portal}</span>
                   {scholarship.state && (
-                    <span className="text-[10px] font-semibold text-primary bg-primary-fixed/50 px-2 py-0.5 rounded-md flex items-center gap-1">
+                    <span className="text-[10px] font-semibold text-primary bg-primary-fixed/50 px-2 py-0.5 rounded-md inline-flex items-center gap-0.5 max-w-[180px]">
                       <span className="material-symbols-outlined text-[12px]">location_on</span>
-                      {scholarship.state}
+                      <span className="truncate">{scholarship.state}</span>
                     </span>
                   )}
-                  {scholarship.university && (
-                    <span className="text-[10px] font-semibold text-secondary bg-secondary-fixed/50 px-2 py-0.5 rounded-md flex items-center gap-1">
-                      <span className="material-symbols-outlined text-[12px]">account_balance</span>
-                      {scholarship.university}
+                  {daysLeft !== null ? (
+                    <span className={cn('text-[10px] font-bold px-2 py-0.5 rounded-md', daysLeft <= CLOSING_SOON_DAYS ? 'bg-error text-white' : 'bg-saffron/15 text-saffron')}>
+                      {daysLeft <= 0 ? 'Last day today' : daysLeft <= CLOSING_SOON_DAYS ? `${daysLeft} days left` : `Till ${closeDate}`}
                     </span>
+                  ) : (
+                    <span className="text-[10px] font-bold text-india-green bg-india-green/10 px-2 py-0.5 rounded-md">Open</span>
                   )}
-                  {scholarship.programs && scholarship.programs.length > 0 && (
-                    <span className="text-[10px] font-semibold text-on-surface-variant bg-surface-container-highest px-2 py-0.5 rounded-md">
-                      {scholarship.programs.join(', ')}
+                </div>
+
+                {scholarship.benefits && (
+                  <p className="text-sm font-bold text-on-surface mb-2 line-clamp-2">{scholarship.benefits}</p>
+                )}
+                <p className="text-xs text-on-surface-variant leading-relaxed mb-3 line-clamp-3">{scholarship.eligibility}</p>
+
+                <div className="flex flex-wrap gap-1.5 mb-3">
+                  {scholarship.education_levels.slice(0, 3).map((level) => (
+                    <span key={level} className="text-[10px] text-primary font-semibold bg-primary-fixed px-2 py-0.5 rounded-md">
+                      {LEVEL_LABELS[level]}
                     </span>
-                  )}
+                  ))}
+                  {scholarship.target_groups.slice(0, 2).map((group) => (
+                    <span key={group} className="text-[10px] text-on-surface-variant bg-surface-container-low px-2 py-0.5 rounded-md">
+                      {group}
+                    </span>
+                  ))}
                 </div>
 
-                <p className="text-xs font-bold uppercase tracking-wider text-on-surface-variant mb-1">Benefits</p>
-                <p className="font-mono font-bold text-base text-on-surface mb-3">{scholarship.benefits}</p>
-
-                <p className="text-xs text-on-surface-variant leading-relaxed mb-4">
-                  {scholarship.eligibility}
-                </p>
-
-                <div className="mb-4">
-                  <p className="text-[10px] font-bold text-on-surface-variant uppercase tracking-wider mb-1.5">
-                    Education Level
-                  </p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {scholarship.education_levels.map((level) => (
-                      <span
-                        key={level}
-                        className="text-[10px] text-primary font-semibold bg-primary-fixed px-2 py-0.5 rounded-md"
-                      >
-                        {LEVEL_LABELS[level]}
-                      </span>
-                    ))}
+                {user && requiredCount > 0 && (
+                  <div className="mb-3 flex items-center justify-between text-xs bg-surface-container-low px-2 py-1.5 rounded-lg border border-outline-variant/30">
+                    <span className="text-on-surface-variant">Docs ready</span>
+                    <span className={cn('font-bold', docReadinessPct === 100 ? 'text-india-green' : docReadinessPct >= 50 ? 'text-saffron' : 'text-error')}>
+                      {docReadinessPct}% ({readyCount}/{requiredCount})
+                    </span>
                   </div>
-                </div>
+                )}
 
-                <div className="mb-4">
-                  <p className="text-[10px] font-bold text-on-surface-variant uppercase tracking-wider mb-1.5">
-                    Who Can Apply
-                  </p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {scholarship.target_groups.slice(0, 4).map((group) => (
-                      <span
-                        key={group}
-                        className="text-[10px] text-on-surface-variant bg-surface-container-low px-2 py-0.5 rounded-md"
-                      >
-                        {group}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="mb-4">
-                  <p className="text-[10px] font-bold text-on-surface-variant uppercase tracking-wider mb-1.5">
-                    Documents Required
-                  </p>
-                  <div className="flex flex-wrap gap-1.5">
-                    {scholarship.documents_required?.slice(0, 4).map((doc) => (
-                      <span
-                        key={doc}
-                        className="text-[10px] text-on-surface-variant bg-surface-container-low px-2 py-0.5 rounded-md"
-                      >
-                        {doc}
-                      </span>
-                    ))}
-                  </div>
-                  {user && requiredCount > 0 && (
-                    <div className="mt-2 flex items-center justify-between text-xs bg-surface-container-low px-2 py-1.5 rounded-lg border border-outline-variant/30">
-                      <span className="text-on-surface-variant">Docs Ready:</span>
-                      <span className={`font-bold ${docReadinessPct === 100 ? "text-india-green" : docReadinessPct >= 50 ? "text-saffron" : "text-error"}`}>
-                        {docReadinessPct}% ({readyCount}/{requiredCount})
-                      </span>
-                    </div>
-                  )}
-                </div>
-
-                <div className="bg-surface-container-low border border-outline-variant/30 rounded-xl p-3 mb-4 space-y-2">
-                  <p className="text-[10px] font-bold text-on-surface flex items-center gap-1.5">
-                    <span className="material-symbols-outlined text-sm text-primary">verified_user</span>
-                    Source: Official government portal
-                  </p>
-                  <p className="text-[10px] text-on-surface-variant flex items-center gap-1.5">
-                    <span className="material-symbols-outlined text-sm text-secondary">update</span>
-                    Last checked: {feed?.meta?.fetched_at ? new Date(feed.meta.fetched_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' }) : 'Today'}
-                  </p>
-                  <p className="text-[10px] text-on-surface-variant flex items-center gap-1.5">
-                    <span className="material-symbols-outlined text-sm text-tertiary">info</span>
-                    Status: <span className="font-semibold capitalize">{scholarship.status}</span>
-                  </p>
-                  <p className="text-[10px] font-semibold text-primary flex items-center gap-1.5">
-                    <span className="material-symbols-outlined text-sm">link</span>
-                    Apply only on: <a href={scholarship.application_url} target="_blank" rel="noopener noreferrer" className="hover:underline text-primary truncate">official link</a>
-                  </p>
-                  <div className="mt-2 bg-error-container/40 rounded-lg p-2 flex items-start gap-1.5">
-                    <span className="material-symbols-outlined text-sm text-error shrink-0 mt-0.5">warning</span>
-                    <p className="text-[9px] font-medium text-on-surface leading-snug">
-                      <span className="text-error font-bold uppercase tracking-wider">Warning:</span> Do not share OTP, Aadhaar password, or bank details with anyone. Use only the official portal.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="mt-auto space-y-3">
-                  <div className="flex items-center gap-2 text-xs text-on-surface-variant">
-                    <span className="material-symbols-outlined text-base text-secondary">event</span>
-                    <span>{closeDate ? `Student application open till ${closeDate}` : "Verify deadline on official website"}</span>
-                  </div>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => {
-                        if (!isTracked) {
-                          trackApplication({
-                            id: scholarship.id,
-                            title: scholarship.name,
-                            type: 'scholarship',
-                            status: 'Interested',
-                            portal_url: scholarship.application_url,
-                            deadline: scholarship.studentApplicationCloseDate,
-                          });
-                        }
-                      }}
-                      disabled={isTracked}
-                      className="flex-1 inline-flex items-center justify-center gap-1.5 bg-surface-container-high hover:bg-surface-container-highest text-on-surface font-bold text-sm px-3 py-2.5 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      <span className="material-symbols-outlined text-[18px]">
-                        {isTracked ? 'check_circle' : 'bookmark_add'}
-                      </span>
-                      {isTracked ? 'Tracked' : 'Track'}
-                    </button>
-                    <a
-                      href={scholarship.specifications_url || scholarship.application_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex flex-[1.5] items-center justify-center gap-2 bg-primary hover:bg-primary-container text-on-primary font-bold text-sm px-4 py-2.5 rounded-xl transition-colors"
-                    >
-                      <span className="material-symbols-outlined text-lg">open_in_new</span>
-                      Apply
-                    </a>
-                  </div>
+                <div className="mt-auto grid grid-cols-[auto_1fr_1fr] gap-2">
+                  <button
+                    onClick={() =>
+                      !isTracked &&
+                      trackApplication({
+                        id: scholarship.id,
+                        title: scholarship.name,
+                        type: 'scholarship',
+                        status: 'Interested',
+                        portal_url: scholarship.application_url,
+                        deadline: scholarship.studentApplicationCloseDate,
+                      })
+                    }
+                    disabled={isTracked}
+                    title={isTracked ? 'Tracked' : 'Track this scholarship'}
+                    className="inline-flex items-center justify-center w-11 bg-surface-container-high hover:bg-surface-container-highest text-on-surface rounded-xl transition-colors disabled:text-india-green"
+                  >
+                    <span className="material-symbols-outlined text-[20px]">{isTracked ? 'bookmark_added' : 'bookmark_add'}</span>
+                  </button>
+                  <button
+                    onClick={() => setSelected(scholarship)}
+                    className="inline-flex items-center justify-center gap-1.5 border border-primary/40 text-primary hover:bg-primary-fixed font-bold text-sm px-3 py-2.5 rounded-xl transition-colors"
+                  >
+                    <span className="material-symbols-outlined text-[18px]">menu_book</span>
+                    Details
+                  </button>
+                  <a
+                    href={applyUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center justify-center gap-1.5 bg-primary hover:bg-primary-container text-on-primary font-bold text-sm px-3 py-2.5 rounded-xl transition-colors"
+                  >
+                    <span className="material-symbols-outlined text-[18px]">open_in_new</span>
+                    Apply
+                  </a>
                 </div>
               </article>
             );
           })}
         </div>
+      )}
+
+      {!loading && !error && visibleCount < filteredScholarships.length && (
+        <div className="flex justify-center">
+          <button
+            onClick={() => setVisibleCount((v) => v + PAGE_SIZE)}
+            className="inline-flex items-center gap-2 bg-primary hover:bg-primary-container text-on-primary font-bold px-6 py-3 rounded-xl transition-colors"
+          >
+            <span className="material-symbols-outlined">expand_more</span>
+            Load more scholarships ({filteredScholarships.length - visibleCount} more)
+          </button>
+        </div>
+      )}
+
+      {selected && (
+        <SchemeDetailModal
+          title={selected.name}
+          slug={selected.myscheme_slug}
+          applyUrl={selected.specifications_url || selected.application_url}
+          fallback={{
+            description: selected.eligibility,
+            benefits: selected.benefits,
+            documents: selected.documents_required,
+            deadline: selected.studentApplicationCloseDate,
+            department: selected.department,
+          }}
+          onClose={() => setSelected(null)}
+        />
       )}
 
       <div className="text-center py-4">

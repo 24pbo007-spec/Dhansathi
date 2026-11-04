@@ -17,7 +17,8 @@ export async function loadLiveSchemeFeed(): Promise<LiveSchemeFeed | null> {
   // Prefer the live myScheme feed (refreshed daily via edge cache); fall back
   // to the committed static snapshot if the live endpoint is unavailable.
   try {
-    const live = await fetch('/api/schemes', { cache: 'no-store' });
+    // Browser cache (15 min) + edge cache (until 00:30 IST) keep repeat visits instant.
+    const live = await fetch('/api/schemes');
     if (live.ok) {
       const feed = (await live.json()) as LiveSchemeFeed & { error?: string };
       if (!feed.error && feed.schemes?.length) return feed;

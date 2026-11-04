@@ -7,12 +7,14 @@ import {
   type SimulationResult,
   type SimulationProgress,
 } from '@/lib/simulationService';
-import { fetchLiveStocks, searchAndFetchStocks } from '@/lib/stockApi';
+import { fetchAnyStock, fetchLiveStocks } from '@/lib/stockApi';
+import { loadStockUniverse, searchStockUniverse, type UniverseStock } from '@/lib/stockUniverse';
 import type { StockData } from '@/types';
 import { useAuthStore } from '@/stores/authStore';
 import { usePlanStore } from '@/stores/planStore';
 import { useLanguageStore } from '@/stores/languageStore';
 import { T } from '@/lib/translations';
+import { SimulationDetails } from './SimulationDetails';
 
 /* ── Animation helpers ─────────────────────────── */
 
@@ -89,6 +91,18 @@ const SCENARIO_PRESETS: ScenarioPreset[] = [
 
 const HORIZONS = ['1 Day', '1 Week', '2 Weeks', '1 Month', '1 Year'] as const;
 
+interface PickerItem {
+  symbol: string;
+  name: string;
+  exchange: 'NSE' | 'BSE';
+  tag?: string;
+  price?: number;
+  change_pct?: number;
+}
+
+const inr = (value?: number | null) =>
+  value == null ? 'N/A' : `₹${value.toLocaleString('en-IN', { maximumFractionDigits: value < 100 ? 2 : 0 })}`;
+
 /* ── Component ─────────────────────────────────── */
 
 export default function SimulatorPage() {
@@ -97,10 +111,13 @@ export default function SimulatorPage() {
   const [isStockDropdownOpen, setIsStockDropdownOpen] = useState(false);
   const stockSearchRef = useRef<HTMLDivElement>(null);
   const [liveStocks, setLiveStocks] = useState<StockData[]>([]);
-  const [searchResults, setSearchResults] = useState<StockData[]>([]);
+  const [universeResults, setUniverseResults] = useState<UniverseStock[]>([]);
+  const [universeCount, setUniverseCount] = useState<number | null>(null);
+  const [selectedExchange, setSelectedExchange] = useState<'NSE' | 'BSE'>('NSE');
+  const [selectedName, setSelectedName] = useState('Reliance Industries Limited');
+  const [selectedQuote, setSelectedQuote] = useState<StockData | null>(null);
   const [loadingStocks, setLoadingStocks] = useState(true);
   const [searching, setSearching] = useState(false);
-  const searchTimeout = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [selectedScenario, setSelectedScenario] = useState<string | null>(null);
   const [customScenario, setCustomScenario] = useState('');
   const [horizon, setHorizon] = useState<typeof HORIZONS[number]>('1 Month');
@@ -129,42 +146,63 @@ export default function SimulatorPage() {
     return () => { cancelled = true; };
   }, []);
 
-  // Debounced search for stocks beyond Nifty 50
+  // Every NSE/BSE stock on Angel One is searched locally — instant, no network per keystroke.
   useEffect(() => {
-    if (!stockSearch.trim() || stockSearch.trim().length < 2) {
-      setSearchResults([]);
-      return;
-    }
-    // Check if local stocks already match
-    const q = stockSearch.toLowerCase();
-    const localMatches = liveStocks.filter(
-      (s) => s.symbol.toLowerCase().includes(q) || s.name.toLowerCase().includes(q),
-    );
-    if (localMatches.length >= 3) {
-      setSearchResults([]);
-      return;
-    }
-    // Debounce remote search
-    if (searchTimeout.current) clearTimeout(searchTimeout.current);
-    searchTimeout.current = setTimeout(async () => {
-      setSearching(true);
-      try {
-        const results = await searchAndFetchStocks(stockSearch.trim());
-        setSearchResults(results.filter((r) => !liveStocks.some((l) => l.symbol === r.symbol)));
-      } catch { setSearchResults([]); }
-      setSearching(false);
-    }, 500);
-    return () => { if (searchTimeout.current) clearTimeout(searchTimeout.current); };
-  }, [stockSearch, liveStocks]);
+    loadStockUniverse()
+      .then((all) => setUniverseCount(all.length))
+      .catch(() => setUniverseCount(null));
+  }, []);
 
-  const filteredStocks = useMemo(() => {
-    const q = stockSearch.toLowerCase().trim();
-    const base = q
-      ? liveStocks.filter((s) => s.symbol.toLowerCase().includes(q) || s.name.toLowerCase().includes(q))
-      : liveStocks;
-    // Merge search results (non-Nifty stocks) at the end
-    return [...base, ...searchResults];
-  }, [stockSearch, liveStocks, searchResults]);
+  useEffect(() => {
+    const q = stockSearch.trim();
+    if (!q) {
+      setUniverseResults([]);
+      return;
+    }
+    let cancelled = false;
+    setSearching(true);
+    searchStockUniverse(q, 30)
+      .then((results) => !cancelled && setUniverseResults(results))
+      .catch(() => !cancelled && setUniverseResults([]))
+      .finally(() => !cancelled && setSearching(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [stockSearch]);
+
+  const liveBySymbol = useMemo(() => new Map(liveStocks.map((s) => [s.symbol, s])), [liveStocks]);
+
+  const pickerItems = useMemo<PickerItem[]>(() => {
+    if (!stockSearch.trim()) {
+      return liveStocks.map((s) => ({ symbol: s.symbol, name: s.name, exchange: 'NSE', tag: 'Nifty 50', price: s.price, change_pct: s.change_pct }));
+    }
+    return universeResults.map((u) => {
+      const live = u.exchange === 'NSE' ? liveBySymbol.get(u.symbol) : undefined;
+      return {
+        symbol: u.symbol,
+        name: u.name,
+        exchange: u.exchange,
+        tag: u.type === 'ETF' ? 'ETF' : ['SM', 'ST', 'SZ'].includes(u.series) ? 'SME' : undefined,
+        price: live?.price,
+        change_pct: live?.change_pct,
+      };
+    });
+  }, [stockSearch, liveStocks, universeResults, liveBySymbol]);
+
+  // Live quote for the selected stock when it is outside the preloaded Nifty 50.
+  useEffect(() => {
+    if (liveBySymbol.has(selectedStock) && selectedExchange === 'NSE') {
+      setSelectedQuote(null);
+      return;
+    }
+    let cancelled = false;
+    fetchAnyStock(`${selectedStock}.${selectedExchange === 'BSE' ? 'BO' : 'NS'}`)
+      .then((quote) => !cancelled && setSelectedQuote(quote))
+      .catch(() => !cancelled && setSelectedQuote(null));
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedStock, selectedExchange, liveBySymbol]);
 
   // Close stock dropdown on outside click
   useEffect(() => {
@@ -177,7 +215,7 @@ export default function SimulatorPage() {
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  const selectedStockObj = filteredStocks.find((s) => s.symbol === selectedStock) || liveStocks.find((s) => s.symbol === selectedStock);
+  const selectedStockObj = (selectedExchange === 'NSE' ? liveBySymbol.get(selectedStock) : undefined) || selectedQuote;
 
   const creditsRemaining = planRemaining('dhanmitra');
   const aiMode = isAIModeAvailable();
@@ -197,6 +235,7 @@ export default function SimulatorPage() {
       const simResult = await runSimulation(
         {
           symbol: selectedStock,
+          exchange: selectedExchange,
           scenarioId: selectedScenario,
           customScenario,
           horizon,
@@ -230,7 +269,7 @@ export default function SimulatorPage() {
       setIsRunning(false);
       setProgress(null);
     }
-  }, [selectedStock, selectedScenario, customScenario, horizon, creditsRemaining, planUseCredit, user]);
+  }, [selectedStock, selectedExchange, selectedScenario, customScenario, horizon, creditsRemaining, planUseCredit, user]);
 
   return (
     <motion.div
@@ -263,7 +302,7 @@ export default function SimulatorPage() {
               : 'bg-saffron/15 text-saffron',
           )}>
             <span className="material-symbols-outlined text-[14px]">{aiMode ? 'auto_awesome' : 'memory'}</span>
-            <span>{aiMode ? 'Full AI Mode' : 'Smart Local Mode'}</span>
+            <span>Real market data + Gemma AI</span>
           </div>
 
           <div className="flex items-center space-x-2 bg-surface-container rounded-xl px-4 py-2.5">
@@ -321,7 +360,7 @@ export default function SimulatorPage() {
                   <input
                     type="text"
                     placeholder={T('simulator', 'searchStock', lang)}
-                    value={isStockDropdownOpen ? stockSearch : (stockSearch || (selectedStockObj ? `${selectedStockObj.symbol} — ${selectedStockObj.name} — ₹${selectedStockObj.price?.toLocaleString('en-IN')}` : selectedStock))}
+                    value={isStockDropdownOpen ? stockSearch : `${selectedStock} — ${selectedStockObj?.name || selectedName}${selectedStockObj ? ` — ${inr(selectedStockObj.price)}` : ''}`}
                     onFocus={() => {
                       setIsStockDropdownOpen(true);
                       setStockSearch('');
@@ -346,45 +385,54 @@ export default function SimulatorPage() {
                 </div>
                 {isStockDropdownOpen && (
                   <div className="absolute z-50 mt-1 w-full max-h-72 overflow-y-auto bg-white border border-outline-variant/20 rounded-xl shadow-xl">
-                    {loadingStocks ? (
+                    {loadingStocks && !stockSearch.trim() ? (
                       <div className="px-4 py-6 text-sm text-on-surface-variant text-center flex items-center justify-center space-x-2">
                         <span className="material-symbols-outlined animate-spin text-[16px]">progress_activity</span>
                         <span>Loading live stock prices...</span>
                       </div>
-                    ) : filteredStocks.length > 0 ? (
+                    ) : pickerItems.length > 0 ? (
                       <>
-                        {filteredStocks.map((s) => (
+                        {!stockSearch.trim() && (
+                          <p className="px-4 pt-3 pb-1 text-[10px] font-bold uppercase tracking-wider text-on-surface-variant">
+                            Nifty 50 · type to search all {universeCount ? universeCount.toLocaleString('en-IN') : ''} NSE &amp; BSE stocks
+                          </p>
+                        )}
+                        {pickerItems.map((s) => (
                           <button
-                            key={s.symbol}
+                            key={`${s.exchange}-${s.symbol}`}
                             onClick={() => {
                               setSelectedStock(s.symbol);
+                              setSelectedExchange(s.exchange);
+                              setSelectedName(s.name);
                               setStockSearch('');
                               setIsStockDropdownOpen(false);
                               setResult(null);
                             }}
                             className={cn(
-                              'w-full text-left px-4 py-2.5 text-sm transition-colors hover:bg-primary-fixed/30 flex items-center justify-between',
-                              selectedStock === s.symbol ? 'bg-primary-fixed/20 font-bold text-primary' : 'text-on-surface',
+                              'w-full text-left px-4 py-2.5 text-sm transition-colors hover:bg-primary-fixed/30 flex items-center justify-between gap-2',
+                              selectedStock === s.symbol && selectedExchange === s.exchange ? 'bg-primary-fixed/20 font-bold text-primary' : 'text-on-surface',
                             )}
                           >
-                            <div>
-                              <span className="font-mono font-semibold">{s.symbol}</span>
-                              <span className="text-on-surface-variant font-normal"> — {s.name}</span>
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-mono font-semibold">{s.symbol}</span>
+                                <span className={cn('text-[9px] font-bold px-1.5 py-0.5 rounded', s.exchange === 'NSE' ? 'bg-primary-fixed text-primary' : 'bg-tertiary-fixed text-tertiary')}>
+                                  {s.exchange}
+                                </span>
+                                {s.tag && <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-surface-container-high text-on-surface-variant">{s.tag}</span>}
+                              </div>
+                              <p className="text-xs text-on-surface-variant font-normal truncate">{s.name}</p>
                             </div>
-                            <div className="text-right ml-2 shrink-0">
-                              <span className="font-mono font-semibold">₹{s.price?.toLocaleString('en-IN')}</span>
-                              <span className={cn('ml-1.5 text-xs font-bold', s.change_pct >= 0 ? 'text-india-green' : 'text-error')}>
-                                {s.change_pct >= 0 ? '+' : ''}{s.change_pct?.toFixed(2)}%
-                              </span>
-                            </div>
+                            {s.price != null && (
+                              <div className="text-right shrink-0">
+                                <span className="font-mono font-semibold">{inr(s.price)}</span>
+                                <span className={cn('ml-1.5 text-xs font-bold', (s.change_pct ?? 0) >= 0 ? 'text-india-green' : 'text-error')}>
+                                  {(s.change_pct ?? 0) >= 0 ? '+' : ''}{s.change_pct?.toFixed(2)}%
+                                </span>
+                              </div>
+                            )}
                           </button>
                         ))}
-                        {searching && (
-                          <div className="px-4 py-2 text-xs text-on-surface-variant text-center border-t border-outline-variant/10">
-                            <span className="material-symbols-outlined animate-spin text-[12px] mr-1">progress_activity</span>
-                            Searching more stocks...
-                          </div>
-                        )}
                       </>
                     ) : searching ? (
                       <div className="px-4 py-4 text-sm text-on-surface-variant text-center flex items-center justify-center space-x-2">
@@ -423,7 +471,7 @@ export default function SimulatorPage() {
                 </div>
               )}
               <p className="text-xs text-on-surface-variant mt-2">
-                Live data fetched from NSE via Yahoo Finance • {liveStocks.length} stocks loaded • Search for any NSE stock
+                Search any of {universeCount ? universeCount.toLocaleString('en-IN') : 'all'} NSE &amp; BSE stocks and ETFs listed on Angel One • Live prices from Yahoo Finance
               </p>
             </div>
 
@@ -608,12 +656,12 @@ export default function SimulatorPage() {
                       'flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-bold',
                       result.source === 'ai' ? 'bg-india-green/15 text-india-green' : 'bg-primary-fixed text-primary',
                     )}>
-                      <span className="material-symbols-outlined text-[14px]">{result.source === 'ai' ? 'auto_awesome' : 'memory'}</span>
-                      <span>{result.source === 'ai' ? 'Full AI Analysis' : 'Smart Local Analysis'}</span>
+                      <span className="material-symbols-outlined text-[14px]">{result.source === 'ai' ? 'auto_awesome' : 'calculate'}</span>
+                      <span>{result.source === 'ai' ? 'Real data + AI explanation' : 'Real data (AI explanation unavailable)'}</span>
                     </div>
-                    {!aiMode && (
+                    {result.stock && (
                       <p className="text-xs text-on-surface-variant">
-                        Add <code className="font-mono bg-surface-container px-1.5 py-0.5 rounded">VITE_LLM_API_KEY</code> for deeper AI analysis
+                        {result.stock.name} · {result.stock.exchange} · prices as of {result.stock.as_of}
                       </p>
                     )}
                   </div>
@@ -638,23 +686,25 @@ export default function SimulatorPage() {
                           </div>
                         </div>
                         <div>
-                          <p className="text-sm text-on-surface-variant">{T('simulator', 'confidence', lang)}</p>
+                          <p className="text-sm text-on-surface-variant">
+                            {result.probabilities ? `Chance price ends ${result.direction === 'Bearish' ? 'lower' : 'higher'}` : T('simulator', 'confidence', lang)}
+                          </p>
                           <p className="font-mono text-2xl font-extrabold text-on-surface">
                             {result.confidence}%
                           </p>
                         </div>
                       </div>
                       <div className="text-right space-y-1">
-                        <p className="text-sm text-on-surface-variant">{T('simulator', 'targetPrice', lang)}</p>
+                        <p className="text-sm text-on-surface-variant">{T('simulator', 'targetPrice', lang)} <span className="text-[10px]">(median)</span></p>
                         <p className="font-mono text-xl font-extrabold text-on-surface">
                           ₹{result.targetPrice.toLocaleString('en-IN')}
                         </p>
                         <p className="text-xs text-on-surface-variant">
-                          Range: ₹{result.priceRange.low.toLocaleString('en-IN')} — ₹{result.priceRange.high.toLocaleString('en-IN')}
+                          80% range: ₹{result.priceRange.low.toLocaleString('en-IN')} — ₹{result.priceRange.high.toLocaleString('en-IN')}
                         </p>
                         <p className="text-xs text-on-surface-variant">
                           Current: <span className="font-mono font-semibold">₹{result.currentPrice.toLocaleString('en-IN')}</span>
-                          {' '}| Stop: <span className="font-mono font-semibold text-error">₹{result.stopLoss.toLocaleString('en-IN')}</span>
+                          {' '}| Stop (2×ATR): <span className="font-mono font-semibold text-error">₹{result.stopLoss.toLocaleString('en-IN')}</span>
                         </p>
                       </div>
                     </div>
@@ -695,6 +745,8 @@ export default function SimulatorPage() {
                     </div>
                   </div>
 
+                  {result.percentiles && result.probabilities && <SimulationDetails result={result} />}
+
                   {/* Thinking Process (Reasoning) */}
                   {result.reasoning && (
                     <div className="bg-primary/5 rounded-2xl border border-primary/20 p-5">
@@ -703,8 +755,8 @@ export default function SimulatorPage() {
                           <span className="material-symbols-outlined text-primary text-[16px]">psychology</span>
                         </div>
                         <div>
-                          <p className="text-[10px] font-bold uppercase tracking-wider text-primary mb-1 opacity-70">AI Thinking Process</p>
-                          <p className="text-xs text-on-surface-variant italic font-mono leading-relaxed">{result.reasoning}</p>
+                          <p className="text-[10px] font-bold uppercase tracking-wider text-primary mb-1 opacity-70">Why these numbers</p>
+                          <p className="text-sm text-on-surface-variant leading-relaxed">{result.reasoning}</p>
                         </div>
                       </div>
                     </div>
@@ -791,7 +843,7 @@ export default function SimulatorPage() {
                   <div className="bg-surface-container-lowest rounded-2xl border border-outline-variant/20 p-6">
                     <div className="flex items-center space-x-2 mb-5">
                       <span className="material-symbols-outlined text-primary text-[20px]">timeline</span>
-                      <h4 className="font-headline font-bold text-on-surface">Projected Timeline</h4>
+                      <h4 className="font-headline font-bold text-on-surface">Simulated Price Path</h4>
                     </div>
                     <div className="space-y-0">
                       {result.timeline.map((item, idx) => (
