@@ -4,6 +4,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { StockData } from '@/types';
+import { searchStockUniverse } from '@/lib/stockUniverse';
 
 // ─── MarketOverview Type ─────────────────────────────────────────────────────
 
@@ -48,7 +49,8 @@ const NIFTY50_STOCKS: StockDefinition[] = [
   { symbol: 'LT', yahooTicker: 'LT.NS', name: 'Larsen & Toubro Ltd', sector: 'Infrastructure', basePrice: 3650, baseMarketCap: 500000, basePE: 34.0, baseAvgVolume: 3000000 },
   { symbol: 'AXISBANK', yahooTicker: 'AXISBANK.NS', name: 'Axis Bank Ltd', sector: 'Banking', basePrice: 1180, baseMarketCap: 365000, basePE: 14.5, baseAvgVolume: 8000000 },
   { symbol: 'KOTAKBANK', yahooTicker: 'KOTAKBANK.NS', name: 'Kotak Mahindra Bank Ltd', sector: 'Banking', basePrice: 1850, baseMarketCap: 367000, basePE: 22.0, baseAvgVolume: 4500000 },
-  { symbol: 'TATAMOTORS', yahooTicker: 'TATAMOTORS.NS', name: 'Tata Motors Ltd', sector: 'Automobile', basePrice: 780, baseMarketCap: 290000, basePE: 8.5, baseAvgVolume: 14000000 },
+  // Tata Motors demerged in 2025; the passenger-vehicle business trades as TMPV.
+  { symbol: 'TMPV', yahooTicker: 'TMPV.NS', name: 'Tata Motors Passenger Vehicles Ltd', sector: 'Automobile', basePrice: 400, baseMarketCap: 100000, basePE: 0, baseAvgVolume: 9000000 },
   { symbol: 'MARUTI', yahooTicker: 'MARUTI.NS', name: 'Maruti Suzuki India Ltd', sector: 'Automobile', basePrice: 12500, baseMarketCap: 390000, basePE: 30.0, baseAvgVolume: 1200000 },
   { symbol: 'SUNPHARMA', yahooTicker: 'SUNPHARMA.NS', name: 'Sun Pharmaceutical Industries', sector: 'Pharma', basePrice: 1850, baseMarketCap: 445000, basePE: 38.0, baseAvgVolume: 4000000 },
   { symbol: 'BAJFINANCE', yahooTicker: 'BAJFINANCE.NS', name: 'Bajaj Finance Ltd', sector: 'Finance', basePrice: 7200, baseMarketCap: 445000, basePE: 32.0, baseAvgVolume: 2800000 },
@@ -113,7 +115,10 @@ interface YahooChartResult {
     fullExchangeName?: string;
     instrumentType?: string;
     currency?: string;
+    regularMarketTime?: number;
+    gmtoffset?: number;
   };
+  timestamp?: number[];
   indicators?: {
     adjclose?: Array<{ adjclose?: Array<number | null> }>;
     quote?: Array<{ close?: Array<number | null>; volume?: Array<number | null> }>;
@@ -201,6 +206,28 @@ function getValidCloses(result: YahooChartResult): number[] {
     [];
 
   return closes.filter((c): c is number => typeof c === 'number' && Number.isFinite(c) && c > 0);
+}
+
+/**
+ * Close of the previous trading session. Yahoo's meta.chartPreviousClose is the
+ * close *before the requested range* (a year ago for range=1y), so using it made
+ * every "today's change" really a 1-year change.
+ */
+function getPreviousSessionClose(result: YahooChartResult, price: number): number {
+  const closes = result.indicators?.quote?.[0]?.close || [];
+  const times = result.timestamp || [];
+  const offset = result.meta?.gmtoffset ?? 19800;
+  const day = (t: number) => new Date((t + offset) * 1000).toISOString().slice(0, 10);
+  const bars: { day: string; close: number }[] = [];
+  closes.forEach((c, i) => {
+    if (typeof c === 'number' && Number.isFinite(c) && c > 0 && times[i]) bars.push({ day: day(times[i]), close: c });
+  });
+  if (!bars.length) return result.meta?.previousClose || price;
+  const sessionDay = result.meta?.regularMarketTime ? day(result.meta.regularMarketTime) : bars[bars.length - 1].day;
+  const last = bars[bars.length - 1];
+  // If the latest bar is the current session, the previous session is the bar before it.
+  if (last.day === sessionDay) return bars.length > 1 ? bars[bars.length - 2].close : result.meta?.previousClose || price;
+  return last.close;
 }
 
 function getLatestVolume(result: YahooChartResult, fallback = 0): number {
@@ -299,7 +326,7 @@ async function fetchYahooV8Single(def: StockDefinition): Promise<StockData | nul
     if (!meta || !meta.regularMarketPrice) return null;
 
     const price = meta.regularMarketPrice;
-    const prevClose = meta.chartPreviousClose || price;
+    const prevClose = getPreviousSessionClose(result, price);
     const change = roundTo(price - prevClose, 2);
     const changePct = prevClose ? roundTo(((price - prevClose) / prevClose) * 100, 2) : 0;
     const volume = meta.regularMarketVolume || getLatestVolume(result, def.baseAvgVolume);
@@ -564,11 +591,12 @@ async function fetchYahooIndex(ticker: string): Promise<{ price: number; change:
     if (!response.ok) return null;
 
     const json = await response.json();
-    const meta = getYahooChartResult(json)?.meta;
-    if (!meta?.regularMarketPrice) return null;
+    const indexResult = getYahooChartResult(json);
+    const meta = indexResult?.meta;
+    if (!indexResult || !meta?.regularMarketPrice) return null;
 
     const price = Number(meta.regularMarketPrice);
-    const previousClose = Number(meta.chartPreviousClose || meta.previousClose || price);
+    const previousClose = getPreviousSessionClose(indexResult, price);
     const change = price - previousClose;
     const changePct = previousClose ? (change / previousClose) * 100 : 0;
 
@@ -637,6 +665,50 @@ function buildBaselineStocks(symbols?: string[]): StockData[] {
   return defs.map(buildBaselineStock);
 }
 
+// ─── Live fundamentals ───────────────────────────────────────────────────────
+// P/E and market cap come from /api/quotes (Yahoo, live). The per-stock
+// numbers in NIFTY50_STOCKS are only used if that call fails.
+
+function yahooTickerFor(stock: StockData): string {
+  const def = NIFTY50_STOCKS.find((d) => d.symbol === stock.symbol);
+  if (def) return decodeURIComponent(def.yahooTicker);
+  return /bse|bom/i.test(stock.exchange || '') ? `${stock.symbol}.BO` : `${stock.symbol}.NS`;
+}
+
+interface LiveQuote {
+  ticker: string;
+  pe: number | null;
+  market_cap: number | null;
+}
+
+async function withLiveFundamentals(stocks: StockData[]): Promise<StockData[]> {
+  if (!stocks.length) return stocks;
+  const tickers = stocks.map(yahooTickerFor);
+  const quotes = new Map<string, LiveQuote>();
+  for (let i = 0; i < tickers.length; i += 50) {
+    try {
+      const batch = tickers.slice(i, i + 50).map(encodeURIComponent).join(',');
+      const response = await fetch(`/api/quotes?tickers=${batch}`, { signal: AbortSignal.timeout(10000) });
+      if (!response.ok) continue;
+      const data = (await response.json()) as { quotes?: LiveQuote[] };
+      for (const quote of data.quotes ?? []) quotes.set(quote.ticker.toUpperCase(), quote);
+    } catch {
+      // keep the existing values for this batch
+    }
+  }
+  if (!quotes.size) return stocks;
+  return stocks.map((stock, i) => {
+    const quote = quotes.get(tickers[i].toUpperCase());
+    if (!quote) return stock;
+    return {
+      ...stock,
+      // A loss-making company has no P/E; show 0 ("N/A") rather than a stale estimate.
+      pe_ratio: quote.pe != null ? roundTo(quote.pe, 1) : 0,
+      market_cap: quote.market_cap != null ? Math.round(quote.market_cap / 1e7) : stock.market_cap,
+    };
+  });
+}
+
 export async function fetchLiveStocks(): Promise<StockData[]> {
   const cacheKey = 'all_nifty50';
   const cached = getCached<StockData[]>(cacheKey);
@@ -667,6 +739,8 @@ export async function fetchLiveStocks(): Promise<StockData[]> {
   if (!stocks || stocks.length === 0) {
     console.warn('[stockApi] All live sources failed — using curated baseline');
     stocks = buildBaselineStocks();
+  } else {
+    stocks = await withLiveFundamentals(stocks);
   }
 
   setCache(cacheKey, stocks);
@@ -712,6 +786,8 @@ export async function fetchStockBySymbol(symbol: string): Promise<StockData | nu
   // Fallback to the curated baseline (recent price, flagged estimated) if live fails
   if (!stock) {
     stock = buildBaselineStock(def);
+  } else {
+    [stock] = await withLiveFundamentals([stock]);
   }
 
   if (stock) setCache(cacheKey, stock);
@@ -759,6 +835,8 @@ export async function fetchStockQuotes(symbols: string[]): Promise<StockData[]> 
   // Fallback to the curated baseline if all live APIs fail
   if (!stocks || stocks.length === 0) {
     stocks = buildBaselineStocks(validSymbols);
+  } else {
+    stocks = await withLiveFundamentals(stocks);
   }
 
   setCache(cacheKey, stocks);
@@ -802,190 +880,9 @@ interface YahooSearchApiResponse {
   quotes?: YahooSearchApiQuote[];
 }
 
-// ─── Extended Indian Stock List (Beyond Nifty 50) ────────────────────────────
-// Popular NSE-listed stocks that users commonly search for.
-
-const EXTENDED_INDIAN_STOCKS: { symbol: string; name: string }[] = [
-  // Banks
-  { symbol: 'BANKBARODA', name: 'Bank of Baroda' },
-  { symbol: 'PNB', name: 'Punjab National Bank' },
-  { symbol: 'CANBK', name: 'Canara Bank' },
-  { symbol: 'UNIONBANK', name: 'Union Bank of India' },
-  { symbol: 'IDFCFIRSTB', name: 'IDFC First Bank' },
-  { symbol: 'BANDHANBNK', name: 'Bandhan Bank' },
-  { symbol: 'FEDERALBNK', name: 'Federal Bank' },
-  { symbol: 'RBLBANK', name: 'RBL Bank' },
-  { symbol: 'YESBANK', name: 'Yes Bank' },
-  { symbol: 'AUBANK', name: 'AU Small Finance Bank' },
-  { symbol: 'INDIANB', name: 'Indian Bank' },
-  { symbol: 'IOB', name: 'Indian Overseas Bank' },
-  { symbol: 'CENTRALBK', name: 'Central Bank of India' },
-  { symbol: 'MAHABANK', name: 'Bank of Maharashtra' },
-  { symbol: 'BANKINDIA', name: 'Bank of India' },
-  { symbol: 'UCOBANK', name: 'UCO Bank' },
-  { symbol: 'J&KBANK', name: 'Jammu & Kashmir Bank' },
-  { symbol: 'KARURVYSYA', name: 'Karur Vysya Bank' },
-  { symbol: 'SOUTHBANK', name: 'South Indian Bank' },
-  { symbol: 'CUB', name: 'City Union Bank' },
-  { symbol: 'TMB', name: 'Tamilnad Mercantile Bank' },
-  // IT & Tech
-  { symbol: 'MPHASIS', name: 'Mphasis Ltd' },
-  { symbol: 'COFORGE', name: 'Coforge Ltd' },
-  { symbol: 'PERSISTENT', name: 'Persistent Systems' },
-  { symbol: 'LTTS', name: 'L&T Technology Services' },
-  { symbol: 'HAPPSTMNDS', name: 'Happiest Minds Technologies' },
-  { symbol: 'ZOMATO', name: 'Zomato Ltd' },
-  { symbol: 'PAYTM', name: 'One97 Communications (Paytm)' },
-  { symbol: 'NYKAA', name: 'FSN E-Commerce (Nykaa)' },
-  { symbol: 'POLICYBZR', name: 'PB Fintech (PolicyBazaar)' },
-  { symbol: 'DELHIVERY', name: 'Delhivery Ltd' },
-  { symbol: 'INFOEDGE', name: 'Info Edge (Naukri)' },
-  { symbol: 'IRCTC', name: 'Indian Railway Catering & Tourism' },
-  // Pharma & Healthcare
-  { symbol: 'LUPIN', name: 'Lupin Ltd' },
-  { symbol: 'AUROPHARMA', name: 'Aurobindo Pharma' },
-  { symbol: 'BIOCON', name: 'Biocon Ltd' },
-  { symbol: 'TORNTPHARM', name: 'Torrent Pharmaceuticals' },
-  { symbol: 'ALKEM', name: 'Alkem Laboratories' },
-  { symbol: 'IPCALAB', name: 'IPCA Laboratories' },
-  { symbol: 'LALPATHLAB', name: 'Dr Lal PathLabs' },
-  { symbol: 'MAXHEALTH', name: 'Max Healthcare Institute' },
-  { symbol: 'FORTIS', name: 'Fortis Healthcare' },
-  // Auto & Auto Ancillary
-  { symbol: 'ASHOKLEY', name: 'Ashok Leyland' },
-  { symbol: 'TVSMOTOR', name: 'TVS Motor Company' },
-  { symbol: 'MOTHERSON', name: 'Samvardhana Motherson' },
-  { symbol: 'BOSCHLTD', name: 'Bosch Ltd' },
-  { symbol: 'MRF', name: 'MRF Ltd' },
-  { symbol: 'BALKRISIND', name: 'Balkrishna Industries' },
-  { symbol: 'EXIDEIND', name: 'Exide Industries' },
-  { symbol: 'AMARAJABAT', name: 'Amara Raja Energy' },
-  { symbol: 'ESCORTS', name: 'Escorts Kubota' },
-  { symbol: 'OLECTRA', name: 'Olectra Greentech' },
-  // FMCG & Consumer
-  { symbol: 'DABUR', name: 'Dabur India' },
-  { symbol: 'MARICO', name: 'Marico Ltd' },
-  { symbol: 'GODREJCP', name: 'Godrej Consumer Products' },
-  { symbol: 'COLPAL', name: 'Colgate-Palmolive India' },
-  { symbol: 'EMAMILTD', name: 'Emami Ltd' },
-  { symbol: 'TATAELXSI', name: 'Tata Elxsi' },
-  { symbol: 'JUBLFOOD', name: 'Jubilant FoodWorks' },
-  { symbol: 'DMART', name: 'Avenue Supermarts (DMart)' },
-  { symbol: 'PAGEIND', name: 'Page Industries' },
-  { symbol: 'VBL', name: 'Varun Beverages' },
-  { symbol: 'UBL', name: 'United Breweries' },
-  { symbol: 'MCDOWELL-N', name: 'United Spirits' },
-  // Infrastructure & Real Estate
-  { symbol: 'DLF', name: 'DLF Ltd' },
-  { symbol: 'GODREJPROP', name: 'Godrej Properties' },
-  { symbol: 'OBEROIRLTY', name: 'Oberoi Realty' },
-  { symbol: 'PRESTIGE', name: 'Prestige Estates Projects' },
-  { symbol: 'LODHA', name: 'Macrotech Developers (Lodha)' },
-  { symbol: 'BRIGADE', name: 'Brigade Enterprises' },
-  { symbol: 'IRB', name: 'IRB Infrastructure' },
-  { symbol: 'NBCC', name: 'NBCC India' },
-  // Power & Energy
-  { symbol: 'ADANIGREEN', name: 'Adani Green Energy' },
-  { symbol: 'ADANIPOWER', name: 'Adani Power' },
-  { symbol: 'TATAPOWER', name: 'Tata Power Company' },
-  { symbol: 'NHPC', name: 'NHPC Ltd' },
-  { symbol: 'SJVN', name: 'SJVN Ltd' },
-  { symbol: 'RECLTD', name: 'REC Ltd' },
-  { symbol: 'PFC', name: 'Power Finance Corporation' },
-  { symbol: 'TORNTPOWER', name: 'Torrent Power' },
-  { symbol: 'CESC', name: 'CESC Ltd' },
-  { symbol: 'IEX', name: 'Indian Energy Exchange' },
-  // Metals & Mining
-  { symbol: 'HINDALCO', name: 'Hindalco Industries' },
-  { symbol: 'VEDL', name: 'Vedanta Ltd' },
-  { symbol: 'NMDC', name: 'NMDC Ltd' },
-  { symbol: 'NATIONALUM', name: 'National Aluminium Company' },
-  { symbol: 'HINDZINC', name: 'Hindustan Zinc' },
-  { symbol: 'SAIL', name: 'Steel Authority of India' },
-  { symbol: 'JINDALSTEL', name: 'Jindal Steel & Power' },
-  // Oil & Gas
-  { symbol: 'IOC', name: 'Indian Oil Corporation' },
-  { symbol: 'GAIL', name: 'GAIL India' },
-  { symbol: 'PETRONET', name: 'Petronet LNG' },
-  { symbol: 'MGL', name: 'Mahanagar Gas' },
-  { symbol: 'IGL', name: 'Indraprastha Gas' },
-  { symbol: 'HINDPETRO', name: 'Hindustan Petroleum' },
-  { symbol: 'OIL', name: 'Oil India' },
-  // Telecom & Media
-  { symbol: 'IDEA', name: 'Vodafone Idea' },
-  { symbol: 'TTML', name: 'Tata Teleservices' },
-  { symbol: 'ZEEL', name: 'Zee Entertainment' },
-  { symbol: 'PVR', name: 'PVR INOX' },
-  // Defence & PSU
-  { symbol: 'HAL', name: 'Hindustan Aeronautics' },
-  { symbol: 'BHEL', name: 'Bharat Heavy Electricals' },
-  { symbol: 'MAZAGON', name: 'Mazagon Dock Shipbuilders' },
-  { symbol: 'COCHINSHIP', name: 'Cochin Shipyard' },
-  { symbol: 'BDL', name: 'Bharat Dynamics' },
-  { symbol: 'GRSE', name: 'Garden Reach Shipbuilders' },
-  // Finance & Insurance
-  { symbol: 'CHOLAFIN', name: 'Cholamandalam Investment' },
-  { symbol: 'MANAPPURAM', name: 'Manappuram Finance' },
-  { symbol: 'MUTHOOTFIN', name: 'Muthoot Finance' },
-  { symbol: 'LICHSGFIN', name: 'LIC Housing Finance' },
-  { symbol: 'CANFINHOME', name: 'Can Fin Homes' },
-  { symbol: 'ICICIGI', name: 'ICICI Lombard General Insurance' },
-  { symbol: 'ICICIPRULI', name: 'ICICI Prudential Life Insurance' },
-  { symbol: 'NIACL', name: 'New India Assurance' },
-  { symbol: 'LICI', name: 'Life Insurance Corporation' },
-  // Cement
-  { symbol: 'SHREECEM', name: 'Shree Cement' },
-  { symbol: 'AMBUJACEM', name: 'Ambuja Cements' },
-  { symbol: 'ACC', name: 'ACC Ltd' },
-  { symbol: 'DALMIACEM', name: 'Dalmia Bharat' },
-  { symbol: 'RAMCOCEM', name: 'Ramco Cements' },
-  // Chemicals
-  { symbol: 'PIDILITIND', name: 'Pidilite Industries' },
-  { symbol: 'SRF', name: 'SRF Ltd' },
-  { symbol: 'ATUL', name: 'Atul Ltd' },
-  { symbol: 'DEEPAKNTR', name: 'Deepak Nitrite' },
-  { symbol: 'NAVINFLUOR', name: 'Navin Fluorine International' },
-  // Textiles & Others
-  { symbol: 'RAYMOND', name: 'Raymond Ltd' },
-  { symbol: 'ABFRL', name: 'Aditya Birla Fashion' },
-  { symbol: 'DIXON', name: 'Dixon Technologies' },
-  { symbol: 'POLYCAB', name: 'Polycab India' },
-  { symbol: 'HAVELLS', name: 'Havells India' },
-  { symbol: 'VOLTAS', name: 'Voltas Ltd' },
-  { symbol: 'CROMPTON', name: 'Crompton Greaves Consumer' },
-  { symbol: 'WHIRLPOOL', name: 'Whirlpool of India' },
-  { symbol: 'BLUESTARCO', name: 'Blue Star Ltd' },
-  { symbol: 'KALYANKJIL', name: 'Kalyan Jewellers' },
-  { symbol: 'TITAN', name: 'Titan Company' },
-  // Logistics & Transport
-  { symbol: 'CONCOR', name: 'Container Corporation of India' },
-  { symbol: 'BLUEDART', name: 'Blue Dart Express' },
-  // Agri & Fertilizers
-  { symbol: 'UPL', name: 'UPL Ltd' },
-  { symbol: 'PI', name: 'PI Industries' },
-  { symbol: 'COROMANDEL', name: 'Coromandel International' },
-  { symbol: 'CHAMBALFER', name: 'Chambal Fertilisers' },
-  // Adani Group
-  { symbol: 'ADANITRANS', name: 'Adani Transmission' },
-  { symbol: 'ADANIENSOL', name: 'Adani Energy Solutions' },
-  { symbol: 'AWL', name: 'Adani Wilmar' },
-  { symbol: 'ATGL', name: 'Adani Total Gas' },
-  // Tata Group
-  { symbol: 'TATACOMM', name: 'Tata Communications' },
-  { symbol: 'TATACHEM', name: 'Tata Chemicals' },
-  { symbol: 'TATATECH', name: 'Tata Technologies' },
-  // Reliance Group
-  { symbol: 'JIOFIN', name: 'Jio Financial Services' },
-];
-
-// Build a combined searchable list (Nifty 50 + Extended)
-const ALL_INDIAN_STOCKS = [
-  ...NIFTY50_STOCKS.map((s) => ({ symbol: s.symbol, name: s.name, yahooTicker: s.yahooTicker })),
-  ...EXTENDED_INDIAN_STOCKS.map((s) => ({ symbol: s.symbol, name: s.name, yahooTicker: `${s.symbol}.NS` })),
-];
-
 /**
- * Search for stocks by trying local Indian stock list first, then Yahoo Finance.
+ * Search for stocks: every Angel One NSE/BSE instrument first, then Yahoo Finance
+ * for international tickers.
  * Supports searching by name (e.g., "Bank of Baroda") or ticker (e.g., "BANKBARODA").
  */
 export async function searchYahooStocks(query: string): Promise<YahooSearchResult[]> {
@@ -995,58 +892,22 @@ export async function searchYahooStocks(query: string): Promise<YahooSearchResul
   const cached = getCached<YahooSearchResult[]>(cacheKey);
   if (cached) return cached;
 
-  const q = query.trim().toLowerCase();
-
-  // 1. Search local Indian stock list first (by name or symbol)
-  const localMatches = ALL_INDIAN_STOCKS.filter(
-    (s) =>
-      s.symbol.toLowerCase().includes(q) ||
-      s.name.toLowerCase().includes(q),
-  ).slice(0, 10);
-
+  // 1. Every NSE/BSE stock and ETF on Angel One, searched locally and instantly.
   const results: YahooSearchResult[] = [];
-
-  if (localMatches.length > 0) {
-    // Verify top matches exist on Yahoo Finance (fetch in parallel)
-    const verifyPromises = localMatches.slice(0, 5).map(async (match) => {
-      try {
-        const url = `/api/yahoo-finance/v8/finance/chart/${encodeURIComponent(match.yahooTicker)}?interval=1d&range=1d`;
-        const response = await fetch(url, { signal: AbortSignal.timeout(6000) });
-        if (!response.ok) return null;
-
-        const json = await response.json();
-        const meta = getYahooChartResult(json)?.meta;
-        if (!meta || !meta.regularMarketPrice) return null;
-
-        return {
-          symbol: match.yahooTicker,
-          shortname: meta.shortName || meta.longName || match.name,
-          longname: meta.longName || match.name,
-          exchange: meta.exchangeName || 'NSE',
-          exchDisp: meta.fullExchangeName || 'NSE India',
-          typeDisp: meta.instrumentType || 'Equity',
-        } as YahooSearchResult;
-      } catch {
-        return null;
-      }
-    });
-
-    const verified = await Promise.all(verifyPromises);
-    for (const r of verified) {
-      if (r) results.push(r);
-    }
-
-    // Add remaining unverified local matches as results (they'll be fetched when clicked)
-    for (const match of localMatches.slice(5)) {
+  try {
+    const matches = await searchStockUniverse(query, 15);
+    for (const match of matches) {
       results.push({
-        symbol: match.yahooTicker,
+        symbol: match.ticker,
         shortname: match.name,
         longname: match.name,
-        exchange: 'NSE',
-        exchDisp: 'NSE India',
-        typeDisp: 'Equity',
+        exchange: match.exchange,
+        exchDisp: match.exchange === 'NSE' ? 'NSE India' : 'BSE India',
+        typeDisp: match.type === 'ETF' ? 'ETF' : 'Equity',
       });
     }
+  } catch (err) {
+    console.warn('[stockApi] Stock universe unavailable:', err);
   }
 
   // 2. Ask Yahoo's global search API so company-name searches like Tesla,
@@ -1151,7 +1012,7 @@ export async function fetchAnyStock(yahooTicker: string): Promise<StockData | nu
     if (!meta || !meta.regularMarketPrice) return null;
 
     const price = meta.regularMarketPrice;
-    const prevClose = meta.chartPreviousClose || price;
+    const prevClose = getPreviousSessionClose(result, price);
     const change = roundTo(price - prevClose, 2);
     const changePct = prevClose ? roundTo(((price - prevClose) / prevClose) * 100, 2) : 0;
     const volume = meta.regularMarketVolume || getLatestVolume(result, 0);
@@ -1192,8 +1053,10 @@ export async function fetchAnyStock(yahooTicker: string): Promise<StockData | nu
       warning: 'CMP, change, volume, RSI and SMA use live Yahoo chart data. Delivery percentage is not supplied by this provider.',
     };
 
-    setCache(cacheKey, stock);
-    return stock;
+    const [enriched] = await withLiveFundamentals([{ ...stock, exchange: yahooTicker.endsWith('.BO') ? 'BSE' : stock.exchange }]);
+    const liveStock = { ...enriched, exchange: stock.exchange };
+    setCache(cacheKey, liveStock);
+    return liveStock;
   } catch (err) {
     console.warn(`[stockApi] Failed to fetch ${yahooTicker}:`, err);
     return null;
