@@ -6,7 +6,7 @@ import type { ReactNode } from 'react';
 
 function renderInline(text: string, keyPrefix: string): ReactNode[] {
   const nodes: ReactNode[] = [];
-  const pattern = /\*\*(.+?)\*\*|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|\*([^*\s][^*]*?)\*/g;
+  const pattern = /\*\*(.+?)\*\*|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|\*([^*\s][^*]*?)\*|`([^`]+)`/g;
   let last = 0;
   let match: RegExpExecArray | null;
   let index = 0;
@@ -17,6 +17,12 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
       nodes.push(<strong key={`${keyPrefix}-b${index}`} className="font-semibold text-on-surface">{match[1]}</strong>);
     } else if (match[4]) {
       nodes.push(<em key={`${keyPrefix}-i${index}`}>{match[4]}</em>);
+    } else if (match[5]) {
+      nodes.push(
+        <code key={`${keyPrefix}-c${index}`} className="rounded bg-surface-container-high px-1 py-0.5 font-mono text-[0.9em] text-on-surface">
+          {match[5]}
+        </code>,
+      );
     } else {
       nodes.push(
         <a
@@ -80,8 +86,31 @@ export function Markdown({ text, className }: { text: string; className?: string
     list = null;
   };
 
+  let fence: string[] | null = null;
+
   for (const rawLine of lines) {
     const line = rawLine.trim();
+    // ``` fenced blocks: keep the lines verbatim; the language tag is not shown as text.
+    if (/^```/.test(line)) {
+      if (fence) {
+        const key = `code-${blocks.length}`;
+        blocks.push(
+          <pre key={key} className="overflow-x-auto rounded-xl bg-surface-container-high p-3 text-xs leading-relaxed">
+            <code className="font-mono text-on-surface">{fence.join('\n')}</code>
+          </pre>,
+        );
+        fence = null;
+      } else {
+        flushList();
+        flushTable();
+        fence = [];
+      }
+      continue;
+    }
+    if (fence) {
+      fence.push(rawLine);
+      continue;
+    }
     if (/^\|.*\|$/.test(line)) {
       flushList();
       const cells = line.slice(1, -1).split('|').map((cell) => cell.trim());
@@ -114,6 +143,13 @@ export function Markdown({ text, className }: { text: string; className?: string
   }
   flushList();
   flushTable();
+  if (fence) {
+    blocks.push(
+      <pre key={`code-${blocks.length}`} className="overflow-x-auto rounded-xl bg-surface-container-high p-3 text-xs leading-relaxed">
+        <code className="font-mono text-on-surface">{fence.join('\n')}</code>
+      </pre>,
+    );
+  }
 
   return <div className={className ?? 'space-y-2 text-sm text-on-surface-variant leading-relaxed'}>{blocks}</div>;
 }

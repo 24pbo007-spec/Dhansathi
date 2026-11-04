@@ -5,6 +5,7 @@
 
 import { callGemma, messagesToPrompt } from './_lib/gemma.js';
 import { rateLimit } from './_lib/ratelimit.js';
+import { classifyTopic, offTopicReply, SCOPE_RULE } from './_lib/scope.js';
 
 export const config = {
   maxDuration: 60,
@@ -120,10 +121,25 @@ function sendServerFallback(res, messages, failures) {
   });
 }
 
+/** Reply without calling the model (used for off-topic requests). */
+function sendDirectReply(res, content, label) {
+  res.status(200);
+  res.setHeader('content-type', 'application/json');
+  res.setHeader('x-dhansathi-model-used', label);
+  res.json({
+    id: `${label}-${Date.now()}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: label,
+    choices: [{ index: 0, message: { role: 'assistant', content, reasoning_content: '' }, finish_reason: 'stop' }],
+  });
+}
+
 function wantsJson(body) {
   if (body.response_format?.type === 'json_object') return true;
-  const system = (body.messages || []).find((message) => message.role === 'system');
-  return /only valid json/i.test(String(system?.content || ''));
+  return (body.messages || []).some(
+    (message) => message.role === 'system' && /only valid json/i.test(String(message.content || '')),
+  );
 }
 
 // Gemma's reply wrapped in the OpenAI chat-completion shape the frontend parses.
@@ -163,6 +179,19 @@ export default async function handler(req, res) {
   if (!rateLimit(req, res, { route: 'chat', limit: 20, windowMs: 60000 })) return;
 
   const body = { ...(req.body || {}) };
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const question = getLastUserMessage(messages);
+
+  // Clearly off-topic (code, stories, movies, cricket…): refuse without calling the model.
+  if (classifyTopic(question) === 'off') {
+    sendDirectReply(res, offTopicReply(question), 'dhansathi-scope-guard');
+    return;
+  }
+
+  // Everything else goes to the model with the scope rule first, so it also
+  // declines off-topic requests the keyword check could not recognise.
+  body.messages = [{ role: 'system', content: SCOPE_RULE }, ...messages];
+
   try {
     const upstream = await callGemmaChat(body);
     res.status(200);

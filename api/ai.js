@@ -3,6 +3,7 @@
 
 import { callGemma } from './_lib/gemma.js';
 import { rateLimit } from './_lib/ratelimit.js';
+import { SCOPE_RULE } from './_lib/scope.js';
 
 export const config = { maxDuration: 60 };
 
@@ -23,7 +24,8 @@ export default async function handler(req, res) {
   }
 
   try {
-    const text = await callGemma(prompt, { json: req.body?.json === true, timeoutMs: 50000 });
+    // Same scope as the chat: this proxy is for DhanSathi features, not a general-purpose model.
+    const text = await callGemma(`${SCOPE_RULE}\n\n${prompt}`, { json: req.body?.json === true, timeoutMs: 50000 });
     res.setHeader('Cache-Control', 'no-store');
     return res.status(200).json({ text, model: 'gemma-4-e4b' });
   } catch (error) {
