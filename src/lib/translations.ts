@@ -19,6 +19,8 @@ const t = {
     more: { en: 'More', hi: 'और' },
     proTools: { en: 'Pro Tools', hi: 'प्रो टूल्स' },
     taxCalculator: { en: 'Tax Calculator', hi: 'टैक्स कैलकुलेटर' },
+    salaryCalculator: { en: 'Salary Calculator', hi: 'सैलरी कैलकुलेटर' },
+    gstCalculator: { en: 'GST Calculator', hi: 'GST कैलकुलेटर' },
     budgetAnalyzer: { en: 'Budget Analyzer', hi: 'बजट विश्लेषक' },
     monthlyReports: { en: 'Monthly Reports', hi: 'मासिक रिपोर्ट' },
     applicationTracker: { en: 'Application Tracker', hi: 'एप्लिकेशन ट्रैकर' },
