@@ -6,7 +6,7 @@ import { useAuthStore } from '@/stores/authStore';
 import { T } from '@/lib/translations';
 
 interface NavItem {
-  labelKey: 'dashboard' | 'schemes' | 'scholarships' | 'stocks' | 'crossover' | 'alerts' | 'dhanMitra' | 'askDhanSathi' | 'support' | 'taxCalculator' | 'budgetAnalyzer' | 'monthlyReports' | 'applicationTracker';
+  labelKey: 'dashboard' | 'schemes' | 'scholarships' | 'stocks' | 'crossover' | 'alerts' | 'dhanMitra' | 'askDhanSathi' | 'support' | 'taxCalculator' | 'salaryCalculator' | 'gstCalculator' | 'budgetAnalyzer' | 'monthlyReports' | 'applicationTracker';
   icon: string;
   path: string;
   badge?: string;
@@ -23,6 +23,8 @@ const NAV_ITEMS: NavItem[] = [
   { labelKey: 'dhanMitra', icon: 'psychology', path: '/dashboard/simulator', sectionKey: 'aiTools' },
   { labelKey: 'askDhanSathi', icon: 'chat_bubble', path: '/dashboard/chat', sectionKey: 'aiTools' },
   { labelKey: 'taxCalculator', icon: 'calculate', path: '/dashboard/tax-calculator', sectionKey: 'proTools' },
+  { labelKey: 'salaryCalculator', icon: 'payments', path: '/dashboard/salary-calculator', sectionKey: 'proTools' },
+  { labelKey: 'gstCalculator', icon: 'receipt_long', path: '/dashboard/gst-calculator', sectionKey: 'proTools' },
   { labelKey: 'budgetAnalyzer', icon: 'account_balance_wallet', path: '/dashboard/budget-analyzer', sectionKey: 'proTools' },
   { labelKey: 'monthlyReports', icon: 'assessment', path: '/dashboard/monthly-reports', sectionKey: 'proTools' },
   { labelKey: 'applicationTracker', icon: 'check_circle', path: '/dashboard/applications', sectionKey: 'proTools' },

@@ -23,6 +23,8 @@ const StockDetailPage = lazy(() => import('@/features/stocks/StockDetailPage'));
 const TaxCalculator = lazy(() => import('@/features/tools/TaxCalculator'));
 const BudgetAnalyzer = lazy(() => import('@/features/tools/BudgetAnalyzer'));
 const MonthlyReports = lazy(() => import('@/features/tools/MonthlyReports'));
+const GstCalculator = lazy(() => import('@/features/tools/GstCalculator'));
+const SalaryCalculator = lazy(() => import('@/features/tools/SalaryCalculator'));
 const ApplicationTracker = lazy(() => import('@/features/dashboard/ApplicationTracker'));
 const AuthCallback = lazy(() => import('@/features/auth/AuthCallback'));
 // Legal Pages
@@ -104,6 +106,8 @@ function App() {
             <Route path="tax-calculator" element={<TaxCalculator />} />
             <Route path="budget-analyzer" element={<BudgetAnalyzer />} />
             <Route path="monthly-reports" element={<MonthlyReports />} />
+            <Route path="gst-calculator" element={<GstCalculator />} />
+            <Route path="salary-calculator" element={<SalaryCalculator />} />
             <Route path="applications" element={<ApplicationTracker />} />
           </Route>
           {/* Admin Login */}
