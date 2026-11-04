@@ -15,14 +15,12 @@ export default function AdminLogin() {
     setError('');
     setLoading(true);
 
-    // If Supabase is not configured, use mock login
+    // Admin access requires Supabase: the real gate is the admin_users table
+    // + row-level security, not anything the browser can decide. A hardcoded
+    // dev password ("admin123") used to live here — a backdoor shipped in the
+    // client bundle — and has been removed.
     if (!isSupabaseConfigured) {
-      if (email === 'admin@dhansathi.com' && password === 'admin123') {
-        sessionStorage.setItem('dhansathi_admin', 'true');
-        navigate('/admin');
-      } else {
-        setError('Invalid admin credentials');
-      }
+      setError('Admin login is unavailable — the backend is not configured.');
       setLoading(false);
       return;
     }
@@ -65,8 +63,8 @@ export default function AdminLogin() {
       sessionStorage.setItem('dhansathi_admin', 'true');
       sessionStorage.setItem('dhansathi_admin_role', adminRecord.role);
       navigate('/admin');
-    } catch (err: any) {
-      setError(err.message || 'Failed to login');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to login');
     } finally {
       setLoading(false);
     }

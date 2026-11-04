@@ -5,24 +5,50 @@ import path from 'path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { pathToFileURL } from 'node:url'
 
-type ScholarshipApiModule = {
-  default: (
-    req: IncomingMessage & { query?: Record<string, string> },
-    res: ServerResponse & {
-      status: (code: number) => ServerResponse & { json: (payload: unknown) => void };
-      json: (payload: unknown) => void;
-    },
-  ) => Promise<void>;
+type ApiRequest = IncomingMessage & { query?: Record<string, string>; body?: unknown };
+type ApiResponse = ServerResponse & {
+  status: (code: number) => ApiResponse;
+  json: (payload: unknown) => void;
+  send: (payload: unknown) => void;
+};
+type ApiModule = { default: (req: ApiRequest, res: ApiResponse) => Promise<void> };
+
+// Vercel serverless functions that the Vite dev server should emulate.
+const DEV_API_ROUTES: Record<string, string> = {
+  '/api/scholarships': 'api/scholarships.js',
+  '/api/schemes': 'api/schemes.js',
+  '/api/scheme-detail': 'api/scheme-detail.js',
+  '/api/ai': 'api/ai.js',
+  '/api/simulate': 'api/simulate.js',
+  '/api/quotes': 'api/quotes.js',
+  '/api/recommend': 'api/recommend.js',
+  '/api/chat': 'api/chat.js',
+};
+
+function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve) => {
+    let raw = '';
+    req.on('data', (chunk) => (raw += chunk));
+    req.on('end', () => {
+      try {
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch {
+        resolve({});
+      }
+    });
+  });
 }
 
-function scholarshipApiDevPlugin() {
+function vercelApiDevPlugin() {
   return {
-    name: 'scholarship-api-dev',
-    configureServer(server: { middlewares: { use: (path: string, handler: (req: IncomingMessage, res: ServerResponse) => void) => void } }) {
-      server.middlewares.use('/api/scholarships', (req, res) => {
+    name: 'vercel-api-dev',
+    configureServer(server: { middlewares: { use: (handler: (req: IncomingMessage, res: ServerResponse, next: () => void) => void) => void } }) {
+      server.middlewares.use((req, res, next) => {
         const requestUrl = new URL(req.url || '/', 'http://localhost');
-        const query = Object.fromEntries(requestUrl.searchParams.entries());
+        const file = DEV_API_ROUTES[requestUrl.pathname];
+        if (!file) return next();
 
+        const query = Object.fromEntries(requestUrl.searchParams.entries());
         const apiRes = Object.assign(res, {
           status(code: number) {
             res.statusCode = code;
@@ -32,11 +58,14 @@ function scholarshipApiDevPlugin() {
             res.setHeader('Content-Type', 'application/json');
             res.end(JSON.stringify(payload));
           },
-        });
+          send(payload: unknown) {
+            res.end(payload);
+          },
+        }) as ApiResponse;
 
-        const modulePath = pathToFileURL(path.resolve(__dirname, 'api/scholarships.js')).href;
-        import(/* @vite-ignore */ modulePath)
-          .then((mod: ScholarshipApiModule) => mod.default(Object.assign(req, { query }), apiRes))
+        const modulePath = pathToFileURL(path.resolve(__dirname, file)).href;
+        Promise.all([import(/* @vite-ignore */ modulePath), req.method === 'POST' ? readJsonBody(req) : Promise.resolve(undefined)])
+          .then(([mod, body]: [ApiModule, unknown]) => mod.default(Object.assign(req, { query, body }), apiRes))
           .catch((error: Error) => {
             res.statusCode = 500;
             res.setHeader('Content-Type', 'application/json');
@@ -48,7 +77,7 @@ function scholarshipApiDevPlugin() {
 }
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), scholarshipApiDevPlugin()],
+  plugins: [react(), tailwindcss(), vercelApiDevPlugin()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -59,13 +88,6 @@ export default defineConfig({
     open: true,
     allowedHosts: true,
     proxy: {
-      '/api/nvidia': {
-        target: 'https://integrate.api.nvidia.com',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/nvidia/, ''),
-        proxyTimeout: 120000,
-        timeout: 120000,
-      },
       '/api/pollination': {
         target: 'https://gen.pollinations.ai',
         changeOrigin: true,

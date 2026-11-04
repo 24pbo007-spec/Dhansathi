@@ -8,16 +8,13 @@ import { calculateSchemeMatches, calculateUnclaimedBenefits } from '@/lib/scheme
 import { fetchLiveStocks, fetchStockBySymbol, searchAndFetchStocks } from '@/lib/stockApi';
 import type { StockData, UserProfile } from '@/types';
 import { useProToolsStore, type ProToolsState } from '@/stores/proToolsStore';
+import { SchemeDetailModal } from '@/components/shared/SchemeDetailModal';
+import { buildTaxReport } from '@/lib/tax/engine';
+import { quickToInput, useTaxCalcStore } from '@/stores/taxCalcStore';
+import { Markdown } from '@/components/shared/Markdown';
 
-// NVIDIA AI Configuration
-const DEV_NVIDIA_KEY = import.meta.env.DEV ? import.meta.env.VITE_NVIDIA_API_KEY || '' : '';
-const NVIDIA_BASE_URL =
-  import.meta.env.DEV
-    ? import.meta.env.VITE_NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1'
-    : typeof window !== 'undefined'
-      ? `${window.location.origin}/api/nvidia/v1`
-    : import.meta.env.VITE_NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1';
-const DHANSATHI_CHAT_MODEL = 'z-ai/glm-5.1';
+// All chat goes to api/chat.js, which runs the self-hosted Gemma 4 model.
+const CHAT_ENDPOINT = '/api/chat';
 
 
 /* ── Animation helpers ─────────────────────────── */
@@ -47,10 +44,34 @@ interface ChatMessage {
 }
 
 interface SchemeCard {
+  kind: 'scheme' | 'scholarship';
   name: string;
-  benefit: string;
-  eligibility: string;
-  icon: string;
+  subtitle: string;
+  description: string;
+  url: string;
+  slug?: string;
+  closeDate?: string | null;
+}
+
+interface RecommendedItem {
+  name: string;
+  slug: string;
+  url: string;
+  level: string | null;
+  state: string;
+  ministry: string | null;
+  categories: string[];
+  tags: string[];
+  description: string;
+  close_date: string | null;
+}
+
+interface Recommendations {
+  eligible_total: number;
+  filters_applied: string[];
+  search_terms: string[];
+  schemes: RecommendedItem[];
+  scholarships: RecommendedItem[];
 }
 
 type ChatRequestMessage = {
@@ -58,7 +79,7 @@ type ChatRequestMessage = {
   content: string;
 };
 
-interface NvidiaChatResponse {
+interface ChatCompletionResponse {
   choices?: Array<{
     message?: {
       content?: string | null;
@@ -109,8 +130,8 @@ const STOCK_ALIASES: Record<string, string> = {
   icici: 'ICICIBANK',
   icicibank: 'ICICIBANK',
   sbi: 'SBIN',
-  tatamotors: 'TATAMOTORS',
-  tata: 'TATAMOTORS',
+  tatamotors: 'TMPV',
+  tata: 'TMPV',
   airtel: 'BHARTIARTL',
   bharti: 'BHARTIARTL',
   itc: 'ITC',
@@ -368,7 +389,20 @@ function matchesScholarshipProfile(scholarship: LiveScholarship, user: UserProfi
     }
   }
 
-  return levelMatch && categoryMatch && disabilityMatch && genderMatch && incomeMatch && marksMatch;
+  // 7. State-specific and special-group schemes only for the right people
+  const stateText = `${scholarship.name} ${scholarship.department}`.toLowerCase();
+  const stateMatch =
+    !user.state ||
+    !(scholarship as LiveScholarship & { state?: string }).state ||
+    (scholarship as LiveScholarship & { state?: string }).state!.toLowerCase().includes(user.state.toLowerCase());
+  const regionMatch =
+    !/jammu|kashmir|ladakh/.test(stateText) || /jammu|kashmir|ladakh/i.test(user.state || '');
+  const neMatch = !/north eastern|\bner\b/.test(stateText) ||
+    /assam|arunachal|manipur|meghalaya|mizoram|nagaland|sikkim|tripura/i.test(user.state || '');
+  const serviceMatch =
+    !scholarship.target_groups.includes('Wards of service personnel') || !!user.is_ex_serviceman_family;
+
+  return levelMatch && categoryMatch && disabilityMatch && genderMatch && incomeMatch && marksMatch && stateMatch && regionMatch && neMatch && serviceMatch;
 }
 
 function buildScholarshipContext(user: UserProfile | null, feed: ScholarshipFeed | null): string {
@@ -410,14 +444,22 @@ async function loadLiveScholarshipFeed(): Promise<ScholarshipFeed | null> {
   const cacheKey = `dhansathi-live-scholarships:${day}`;
 
   try {
-    const cached = localStorage.getItem(cacheKey);
-    if (cached) return JSON.parse(cached) as ScholarshipFeed;
+    try {
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) return JSON.parse(cached) as ScholarshipFeed;
+    } catch {
+      // storage blocked — fetch instead
+    }
 
-    const response = await fetch(`/api/scholarships?day=${day}`, { cache: 'no-store' });
+    const response = await fetch(`/api/scholarships?day=${day}`);
     if (!response.ok) throw new Error(`Scholarship feed failed: ${response.status}`);
     const feed = await response.json() as ScholarshipFeed;
     if (feed.error) throw new Error(feed.error);
-    localStorage.setItem(cacheKey, JSON.stringify(feed));
+    try {
+      localStorage.setItem(cacheKey, JSON.stringify(feed));
+    } catch {
+      // ~1.5 MB may exceed the storage quota; the chat already has the data.
+    }
     return feed;
   } catch (error) {
     console.warn('[ChatPage] Scholarship context lookup failed:', error);
@@ -434,6 +476,9 @@ function buildPersonalizationContext(user: UserProfile | null, liveStocks: Stock
   }
 
   const age = getAge(user.date_of_birth);
+  const yesNo = (value?: boolean) => (value == null ? 'Not provided' : value ? 'Yes' : 'No');
+  // Everything from Settings that affects eligibility. PAN, Aadhaar, phone and
+  // email are deliberately never sent to the AI.
   const profileLines = [
     `Name: ${user.full_name || 'Not provided'}`,
     `Age: ${age ?? 'Not provided'}`,
@@ -442,15 +487,24 @@ function buildPersonalizationContext(user: UserProfile | null, liveStocks: Stock
     `District: ${user.district || 'Not provided'}`,
     `Category: ${user.category?.toUpperCase() || 'Not provided'}`,
     `Occupation: ${humanize(user.occupation) || 'Not provided'}`,
-    `Annual income: ${user.annual_income != null ? formatINR(user.annual_income) : 'Not provided'}`,
-    `BPL: ${user.is_bpl ? 'Yes' : 'No'}`,
-    `Disability: ${user.has_disability ? 'Yes' : 'No'}`,
+    `Parent occupation: ${humanize(user.parent_occupation) || 'Not provided'}`,
+    `Annual family income: ${user.annual_income != null ? formatINR(user.annual_income) : 'Not provided'}`,
+    `BPL card: ${yesNo(user.is_bpl)}`,
+    `Disability: ${yesNo(user.has_disability)}`,
+    `Minority community: ${yesNo(user.is_minority)}`,
+    `Farmer family: ${yesNo(user.is_farmer_family)}`,
+    `Orphan / single parent: ${yesNo(user.is_orphan_single_parent)}`,
+    `Ex-serviceman family: ${yesNo(user.is_ex_serviceman_family)}`,
     `Education level: ${formatEducationLevel(user.education_level) || 'Not provided'}`,
     `Current course/class: ${user.current_course || 'Not provided'}`,
-    `Institution: ${user.institution_name || 'Not provided'}`,
+    `Stream: ${user.stream || 'Not provided'}`,
+    `Institution: ${user.institution_name || 'Not provided'} (${user.institution_type || 'type not provided'})`,
+    `Board/University: ${user.board_university || 'Not provided'}`,
     `Current year/semester: ${user.current_year || 'Not provided'}`,
+    `Passing year: ${user.passing_year || 'Not provided'}`,
     `Last exam percentage: ${user.last_exam_percentage != null ? `${user.last_exam_percentage}%` : 'Not provided'}`,
-    `Hosteller: ${user.is_hosteller ? 'Yes' : 'No'}`,
+    `Hosteller: ${yesNo(user.is_hosteller)}`,
+    `Documents ready — income certificate: ${yesNo(user.has_income_certificate)}, caste certificate: ${yesNo(user.has_caste_certificate)}, domicile certificate: ${yesNo(user.has_domicile_certificate)}, Aadhaar-seeded bank account: ${yesNo(user.is_aadhaar_bank_linked)}`,
   ];
 
   const matches = calculateSchemeMatches(user).slice(0, 5);
@@ -458,7 +512,7 @@ function buildPersonalizationContext(user: UserProfile | null, liveStocks: Stock
   const schemeLines = matches.map((match, index) => {
     const reasons = match.reasons.slice(0, 3).join('; ') || 'Partial profile match';
     const gaps = match.missingCriteria.slice(0, 2).join('; ');
-    return `${index + 1}. ${match.scheme.name} (${match.score}% match): ${match.scheme.benefits}. Why: ${reasons}${gaps ? `. Gaps: ${gaps}` : ''}`;
+    return `${index + 1}. ${match.scheme.name} (${match.score}% match): ${match.scheme.benefits || match.scheme.description}. Why: ${reasons}${gaps ? `. Gaps: ${gaps}` : ''}`;
   });
 
   const stockLines = getPersonalizedStockIdeas(user, liveStocks).map((stock, index) =>
@@ -470,12 +524,116 @@ function buildPersonalizationContext(user: UserProfile | null, liveStocks: Stock
     ...profileLines,
     '',
     `Estimated eligible schemes: ${benefits.schemeCount}; estimated potential benefits: ${formatINR(benefits.totalAmount)}.`,
-    'Top scheme matches from DhanSathi engine:',
+    'Popular central schemes from the DhanSathi curated list (with known benefit amounts):',
     ...(schemeLines.length ? schemeLines : ['No strong scheme matches yet. Ask for missing profile details.']),
     '',
     'Stock/trade context from DhanSathi screener:',
     ...(stockLines.length ? stockLines : ['No stock ideas matched the saved profile risk filters.']),
   ].join('\n');
+}
+
+/* ── Profile-matched schemes & scholarships ────── */
+
+const BENEFIT_INTENT =
+  /scheme|yojana|yojna|scholar|fellowship|stipend|eligib|patra|benefit|subsidy|pension|loan|insurance|bima|housing|awas|kisan|farmer|student|padhai|college|school|women|mahila|girl|beti|widow|disab|divyang|ration|health|treatment|job|rozgar|naukri|योजना|छात्रवृत्ति|पात्र|पेंशन|किसान|लोन|बीमा|आवास|महिला|बेटी|पढ़ाई|स्वास्थ्य|नौकरी|रोजगार/i;
+
+function missingProfileFields(user: UserProfile | null): string[] {
+  if (!user) return ['state', 'age', 'gender', 'category', 'annual income', 'occupation'];
+  return [
+    !user.state && 'state',
+    !user.date_of_birth && 'date of birth',
+    !user.gender && 'gender',
+    !user.category && 'category',
+    user.annual_income == null && 'annual income',
+    !user.occupation && 'occupation',
+    user.is_bpl == null && 'BPL status',
+  ].filter(Boolean) as string[];
+}
+
+async function fetchRecommendations(user: UserProfile | null, question: string): Promise<Recommendations | null> {
+  try {
+    const response = await fetch('/api/recommend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // Only eligibility fields leave the browser.
+      body: JSON.stringify({
+        question,
+        profile: user
+          ? {
+              state: user.state,
+              gender: user.gender,
+              category: user.category,
+              occupation: user.occupation,
+              education_level: user.education_level,
+              age: getAge(user.date_of_birth) ?? undefined,
+              has_disability: user.has_disability,
+              is_minority: user.is_minority,
+              is_bpl: user.is_bpl,
+              is_farmer_family: user.is_farmer_family,
+              is_orphan_single_parent: user.is_orphan_single_parent,
+              is_ex_serviceman_family: user.is_ex_serviceman_family,
+            }
+          : {},
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) return null;
+    return (await response.json()) as Recommendations;
+  } catch (error) {
+    console.warn('[ChatPage] Recommendation lookup failed:', error);
+    return null;
+  }
+}
+
+function describeItem(item: RecommendedItem, index: number): string {
+  const where = item.state === 'All India' ? 'All India (central)' : item.state;
+  const closes = item.close_date ? ` | Last date: ${item.close_date}` : '';
+  return `${index + 1}. ${item.name} | ${where} | ${item.ministry || 'Government'} | ${item.description}${closes} | Details & apply: ${item.url}`;
+}
+
+function buildRecommendationContext(rec: Recommendations | null, user: UserProfile | null): string {
+  const missing = missingProfileFields(user);
+  if (!rec) {
+    return 'Website scheme search is unavailable this turn. Recommend only from the curated list above and suggest the Schemes page.';
+  }
+  return [
+    'SCHEMES THIS USER IS ELIGIBLE FOR — from the DhanSathi website catalogue (myScheme, Government of India), already filtered by the official eligibility rules for this profile:',
+    `Eligibility filters applied: ${rec.filters_applied.join('; ') || 'none (profile incomplete)'}.`,
+    `Total eligible schemes on the website for this profile: ${rec.eligible_total}. Ranked for this question by: ${rec.search_terms.join(', ') || 'general relevance'}.`,
+    ...(rec.schemes.length ? rec.schemes.map(describeItem) : ['(no matching schemes for this question)']),
+    ...(rec.scholarships.length
+      ? ['', 'SCHOLARSHIPS THIS USER IS ELIGIBLE FOR (same filters):', ...rec.scholarships.map(describeItem)]
+      : []),
+    '',
+    missing.length
+      ? `Profile fields still missing in Settings (ask the user to fill these for sharper matches): ${missing.join(', ')}.`
+      : 'The profile is complete.',
+  ].join('\n');
+}
+
+function recommendationCards(rec: Recommendations | null, question: string, user: UserProfile | null): SchemeCard[] | undefined {
+  if (!rec) return undefined;
+  // Scholarships join the cards for study questions, or for open "what am I eligible for" questions from students.
+  const wantsStudy =
+    /scholar|fellowship|stipend|student|padhai|college|school|छात्रवृत्ति|पढ़ाई/i.test(question) ||
+    (!!user?.education_level && /eligib|patra|पात्र|kya mil|what can i get|for me|mere liye/i.test(question));
+  const toCard = (item: RecommendedItem, kind: SchemeCard['kind']): SchemeCard => ({
+    kind,
+    name: item.name,
+    subtitle: [item.state === 'All India' ? 'Central · All India' : item.state, item.ministry].filter(Boolean).join(' · '),
+    description: item.description,
+    url: item.url,
+    slug: item.slug,
+    closeDate: item.close_date,
+  });
+  const asksStudy = /scholar|fellowship|stipend|chhatravrit|छात्रवृत्ति|स्कॉलरशिप/i.test(question);
+  const cards = asksStudy && rec.scholarships.length
+    ? rec.scholarships.slice(0, 6).map((i) => toCard(i, 'scholarship'))
+    : [
+        ...(wantsStudy ? rec.scholarships.slice(0, 3).map((i) => toCard(i, 'scholarship')) : []),
+        ...rec.schemes.slice(0, wantsStudy && rec.scholarships.length ? 3 : 5).map((i) => toCard(i, 'scheme')),
+      ];
+  return cards.length ? cards : undefined;
 }
 
 /* ── Sample data ───────────────────────────────── */
@@ -491,40 +649,7 @@ const INITIAL_MESSAGES: ChatMessage[] = [
     id: '1',
     role: 'ai',
     content: WELCOME_EN,
-    timestamp: '10:00 AM',
-  },
-  {
-    id: '2',
-    role: 'user',
-    content: 'Which schemes am I eligible for?',
-    timestamp: '10:01 AM',
-  },
-  {
-    id: '3',
-    role: 'ai',
-    content:
-      'Based on your profile, I found 3 government schemes you may be eligible for. Here are the top matches:',
-    timestamp: '10:01 AM',
-    schemes: [
-      {
-        name: 'PM Kisan Samman Nidhi',
-        benefit: '₹6,000/year direct transfer',
-        eligibility: 'All land-holding farmer families',
-        icon: 'agriculture',
-      },
-      {
-        name: 'Atal Pension Yojana',
-        benefit: '₹1,000-₹5,000/month pension',
-        eligibility: 'Age 18-40, unorganized sector',
-        icon: 'elderly',
-      },
-      {
-        name: 'PM Jeevan Jyoti Bima Yojana',
-        benefit: '₹2,00,000 life insurance',
-        eligibility: 'Age 18-55, savings bank account',
-        icon: 'shield',
-      },
-    ],
+    timestamp: '',
   },
 ];
 
@@ -566,6 +691,23 @@ function TypingIndicator() {
 
 /* ── Component ─────────────────────────────────── */
 
+/** The user's latest Tax Calculator result, computed by the same engine the calculator page uses. */
+function taxCalculatorContext(): string {
+  const { mode, quick, input, regimeChoice } = useTaxCalcStore.getState();
+  const effective = mode === 'quick' ? quickToInput(quick, input) : input;
+  const report = buildTaxReport(effective, regimeChoice === 'auto' ? undefined : regimeChoice);
+  if (report.new.totalIncome === 0 && report.old.totalIncome === 0) {
+    return '- Tax Calculator: not filled yet (suggest opening Pro Tools → Tax Calculator).';
+  }
+  const c = report.chosen;
+  return [
+    `- Tax Calculator (${report.yearLabel}): taxable income ${formatINR(c.totalIncome)}; tax new regime ${formatINR(report.new.totalTax)}, old regime ${formatINR(report.old.totalTax)} — ${report.better} regime is better by ${formatINR(report.saving)}.`,
+    `  Deductions used (${report.chosenRegime} regime): ${c.deductions.map((d) => `${d.label} ${formatINR(d.amount)}`).join('; ') || 'none'}.`,
+    `  ${report.netPayable < 0 ? `Refund due ${formatINR(-report.netPayable)}` : `Balance payable ${formatINR(report.netPayable)}`}; ITR form ${report.itr.form}.`,
+    `  Calculator suggestions: ${report.suggestions.map((s) => s.title).join('; ') || 'none'}.`,
+  ].join('\n');
+}
+
 function buildSystemPrompt(
   user: UserProfile | null,
   isHindi: boolean = false,
@@ -573,14 +715,27 @@ function buildSystemPrompt(
   liveStocks: StockData[] = [],
   proTools: ProToolsState | null = null,
   scholarshipContext = '',
+  recommendationContext = '',
 ): string {
   let prompt = `You are DhanSathi, a helpful financial assistant for users in India. You help with government scheme eligibility, stock analysis, SIP calculations, tax calculations, budget analysis, and personalized financial guidance.
 
-Use the saved profile and DhanSathi app context below whenever answering. If the user asks about scholarships, use the live scholarship context first, match by education level, category, disability, gender, income and state where possible, and mention missing profile details. ALWAYS provide the direct application or details URL for each suggested scholarship using markdown links (e.g. [Apply Here](URL)) so the user can easily click and apply. If the user asks about schemes, recommend the strongest matches first, explain why they match, mention missing profile details if any, and suggest the next action. If the user asks about stocks or trades, use the live stock context first when available. Include CMP, change %, volume, delivery %, RSI, trend, signal, entry discipline, stop-loss thinking, position sizing, and avoid guaranteed-profit language. Always include a short reminder that stock ideas are educational and not financial advice.
+You can see the user's full saved profile from Settings below. Use it in every answer about schemes or scholarships — never ask for a detail that is already in the profile.
+
+SCHEMES & SCHOLARSHIPS — STRICT RULES:
+- Recommend ONLY schemes and scholarships that appear in the lists below (the website's eligibility-filtered list, the curated list, or the live scholarship feed). Never invent a scheme, amount, deadline or link.
+- Prefer the "SCHEMES THIS USER IS ELIGIBLE FOR" list: it is already filtered by official eligibility rules for this user's state, gender and category. Pick the 3-5 most useful for the question.
+- For each one give: **Name**, what it gives, **Why it matches you** (cite the profile facts — state, category, occupation, age, income), and the official link as a markdown link.
+- Only state a benefit amount or income limit if it is written in the list. Otherwise write "see Details for the exact amount". The cards under your answer open the full official details.
+- Tell the user how many schemes in total match their profile on the website and that they can see all of them on the Schemes and Scholarships pages.
+- If profile fields are missing, say which ones and ask the user to add them in Settings.
+
+If the user asks about scholarships, use the scholarship lists first, match by education level, category, disability, gender, income and state where possible, and mention missing profile details. ALWAYS provide the direct application or details URL for each suggested scholarship using markdown links (e.g. [Apply Here](URL)) so the user can easily click and apply. If the user asks about schemes, recommend the strongest matches first, explain why they match, mention missing profile details if any, and suggest the next action. If the user asks about stocks or trades, use the live stock context first when available. Include CMP, change %, volume, delivery %, RSI, trend, signal, entry discipline, stop-loss thinking, position sizing, and avoid guaranteed-profit language. Always include a short reminder that stock ideas are educational and not financial advice.
 
 When recommending schemes or scholarships, ALWAYS use a clear structured format. Use bold headings for: **Scheme Name**, **Benefits**, **Why it matches you**, and **Next Steps**. Also explicitly remind the user: "You can track this application by clicking 'Track' on the scheme/scholarship card in your Dashboard to add it to your Application Tracker."
 
 ${buildPersonalizationContext(user, liveStocks)}
+
+${recommendationContext}
 
 ${scholarshipContext}
 
@@ -593,7 +748,7 @@ ${liveStockContext}`;
     
     prompt += `\n\nUser's Pro Tools Data (from the DhanSathi Tax Calculator and Budget Analyzer):
 - Budget: Total Income ₹${totalIncome}, Total Expenses ₹${totalExp}, Total Savings ₹${totalSav}.
-- Tax Calculator: ${proTools.taxRegime} regime selected. Gross Income: ₹${proTools.taxIncome}, 80C: ₹${proTools.taxSec80c}, 80D: ₹${proTools.taxSec80d}, NPS: ₹${proTools.taxNps}, Home Loan: ₹${proTools.taxHomeLoan}.
+${taxCalculatorContext()}
 If the user asks about their taxes, tax calculator, or budget, explicitly acknowledge that you have fetched their record and use these exact numbers to provide customized advice.`;
   }
 
@@ -607,37 +762,21 @@ If the user asks about their taxes, tax calculator, or budget, explicitly acknow
 }
 
 async function requestDhanSathiAI(messages: ChatRequestMessage[]): Promise<{ content: string; reasoning: string }> {
-  const response = await fetch(`${NVIDIA_BASE_URL}/chat/completions`, {
+  const response = await fetch(CHAT_ENDPOINT, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(DEV_NVIDIA_KEY ? { Authorization: `Bearer ${DEV_NVIDIA_KEY}` } : {}),
     },
-    body: JSON.stringify({
-      model: DHANSATHI_CHAT_MODEL,
-      messages,
-      max_tokens: 700,
-      temperature: 0.4,
-      stream: false,
-      extra_body: {
-        chat_template_kwargs: {
-          enable_thinking: true,
-          clear_thinking: false,
-        },
-      },
-    }),
-    signal: AbortSignal.timeout(45000),
+    body: JSON.stringify({ messages }),
+    signal: AbortSignal.timeout(65000),
   });
 
   if (!response.ok) {
     const body = await response.text().catch(() => '');
-    if (body.includes('image') && body.includes('does not support')) {
-      console.warn('[ChatPage] NVIDIA model rejected the request:', body.slice(0, 180));
-    }
-    throw new Error(`NVIDIA chat failed with HTTP ${response.status}: ${body.slice(0, 240)}`);
+    throw new Error(`Chat failed with HTTP ${response.status}: ${body.slice(0, 240)}`);
   }
 
-  const data = await response.json() as NvidiaChatResponse;
+  const data = await response.json() as ChatCompletionResponse;
   const message = data.choices?.[0]?.message;
   return {
     content: (message?.content || '').trim(),
@@ -659,6 +798,7 @@ export default function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const messageIdRef = useRef(0);
+  const [openCard, setOpenCard] = useState<SchemeCard | null>(null);
 
   const nextMessageId = () => {
     messageIdRef.current += 1;
@@ -710,16 +850,20 @@ export default function ChatPage() {
     let liveStocks: StockData[] = [];
     let scholarshipFeed: ScholarshipFeed | null = null;
     let scholarshipContext = '';
+    let recommendations: Recommendations | null = null;
+    const wantsBenefits = BENEFIT_INTENT.test(messageText) || !hasStockIntent(messageText.toLowerCase());
     try {
-      const [stocks, scholarships] = await Promise.all([
+      const [stocks, scholarships, recs] = await Promise.all([
         fetchLiveStocks().catch((error) => {
           console.warn('[ChatPage] Stock list lookup failed:', error);
           return [] as StockData[];
         }),
         loadLiveScholarshipFeed(),
+        wantsBenefits ? fetchRecommendations(effectiveUser, messageText) : Promise.resolve(null),
       ]);
       liveStocks = stocks;
       scholarshipFeed = scholarships;
+      recommendations = recs;
       scholarshipContext = buildScholarshipContext(effectiveUser, scholarshipFeed);
       askedStock = await resolveAskedStock(messageText);
       liveStockContext = askedStock ? buildLiveStockContext(askedStock) : '';
@@ -727,11 +871,14 @@ export default function ChatPage() {
       console.warn('[ChatPage] Context lookup failed:', error);
     }
 
+    const cards = BENEFIT_INTENT.test(messageText) ? recommendationCards(recommendations, messageText, effectiveUser) : undefined;
+
     const addFallbackResponse = (includeNotice = false) => {
       const aiResponse: ChatMessage = {
         id: nextMessageId(),
         role: 'ai',
-        content: `${includeNotice ? 'Live AI is unavailable right now, so I am using DhanSathi smart mode.\n\n' : ''}${getAIResponse(messageText, effectiveUser, askedStock, liveStocks, scholarshipFeed)}`,
+        content: `${includeNotice ? 'Live AI is unavailable right now, so I am using DhanSathi smart mode.\n\n' : ''}${getAIResponse(messageText, effectiveUser, askedStock, liveStocks, scholarshipFeed, recommendations)}`,
+        schemes: cards,
         timestamp: new Date().toLocaleTimeString('en-US', {
           hour: 'numeric',
           minute: '2-digit',
@@ -752,7 +899,18 @@ export default function ChatPage() {
         }));
 
       const aiResult = await requestDhanSathiAI([
-          { role: "system", content: buildSystemPrompt(effectiveUser, isHindi, liveStockContext, liveStocks, proTools, scholarshipContext) },
+          {
+            role: "system",
+            content: buildSystemPrompt(
+              effectiveUser,
+              isHindi,
+              liveStockContext,
+              liveStocks,
+              proTools,
+              scholarshipContext,
+              wantsBenefits ? buildRecommendationContext(recommendations, effectiveUser) : '',
+            ),
+          },
           ...chatHistory,
           { role: "user", content: liveStockContext ? `${messageText}\n\n${liveStockContext}` : messageText }
         ]);
@@ -764,8 +922,9 @@ export default function ChatPage() {
         {
           id: responseId,
           role: 'ai',
-          content: aiResult.content || getAIResponse(messageText, effectiveUser, askedStock, liveStocks, scholarshipFeed),
+          content: aiResult.content || getAIResponse(messageText, effectiveUser, askedStock, liveStocks, scholarshipFeed, recommendations),
           reasoning: aiResult.reasoning,
+          schemes: cards,
           timestamp: new Date().toLocaleTimeString('en-US', {
             hour: 'numeric',
             minute: '2-digit',
@@ -889,41 +1048,55 @@ export default function ChatPage() {
                         {message.reasoning}
                       </div>
                     )}
-                    <p className="text-sm leading-relaxed whitespace-pre-wrap">
-                      {message.id === '1' ? (isHindi ? WELCOME_HI : WELCOME_EN) : message.content}
-                    </p>
+                    {message.role === 'ai' && message.id !== '1' ? (
+                      <Markdown text={message.content} className="space-y-2 text-sm leading-relaxed text-on-surface" />
+                    ) : (
+                      <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                        {message.id === '1' ? (isHindi ? WELCOME_HI : WELCOME_EN) : message.content}
+                      </p>
+                    )}
                   </div>
 
-                  {/* Scheme Cards */}
+                  {/* Scheme & scholarship cards (from the website catalogue, filtered for this profile) */}
                   {message.schemes && (
                     <div className="mt-3 space-y-2">
-                      {message.schemes.map((scheme) => (
+                      {message.schemes.map((card) => (
                         <div
-                          key={scheme.name}
+                          key={`${card.kind}-${card.slug || card.name}`}
                           className="bg-white rounded-xl border border-outline-variant/20 p-4 hover:shadow-md transition-shadow"
                         >
                           <div className="flex items-start space-x-3">
                             <div className="w-9 h-9 rounded-lg bg-primary-fixed flex items-center justify-center flex-shrink-0">
                               <span className="material-symbols-outlined text-primary text-[18px]">
-                                {scheme.icon}
+                                {card.kind === 'scholarship' ? 'school' : 'account_balance'}
                               </span>
                             </div>
                             <div className="flex-1 min-w-0">
-                              <p className="font-semibold text-on-surface text-sm">
-                                {scheme.name}
+                              <p className="font-semibold text-on-surface text-sm leading-snug">{card.name}</p>
+                              <p className="text-[11px] text-on-surface-variant mt-0.5">
+                                {card.kind === 'scholarship' ? 'Scholarship' : 'Scheme'} · {card.subtitle}
+                                {card.closeDate && <span className="text-error font-semibold"> · Last date {card.closeDate}</span>}
                               </p>
-                              <p className="font-mono text-xs font-semibold text-tertiary mt-0.5">
-                                {scheme.benefit}
-                              </p>
-                              <p className="text-xs text-on-surface-variant mt-1">
-                                {scheme.eligibility}
-                              </p>
+                              <p className="text-xs text-on-surface-variant mt-1 line-clamp-2">{card.description}</p>
+                              <div className="flex gap-2 mt-2">
+                                <button
+                                  onClick={() => setOpenCard(card)}
+                                  className="inline-flex items-center gap-1 text-xs font-bold text-primary border border-primary/30 hover:bg-primary-fixed px-2.5 py-1 rounded-lg"
+                                >
+                                  <span className="material-symbols-outlined text-[14px]">menu_book</span>
+                                  Details
+                                </button>
+                                <a
+                                  href={card.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1 text-xs font-bold text-on-primary bg-primary hover:bg-primary-container px-2.5 py-1 rounded-lg"
+                                >
+                                  <span className="material-symbols-outlined text-[14px]">open_in_new</span>
+                                  Apply
+                                </a>
+                              </div>
                             </div>
-                            <button className="text-primary hover:text-primary-container transition-colors flex-shrink-0">
-                              <span className="material-symbols-outlined text-[18px]">
-                                arrow_forward
-                              </span>
-                            </button>
                           </div>
                         </div>
                       ))}
@@ -1042,11 +1215,21 @@ export default function ChatPage() {
           </button>
         </div>
       </motion.div>
+
+      {openCard && (
+        <SchemeDetailModal
+          title={openCard.name}
+          slug={openCard.slug}
+          applyUrl={openCard.url}
+          fallback={{ description: openCard.description, deadline: openCard.closeDate ?? undefined, department: openCard.subtitle }}
+          onClose={() => setOpenCard(null)}
+        />
+      )}
     </motion.div>
   );
 }
 
-/* ── Mock AI Responses ─────────────────────────── */
+/* ── Offline fallback answers (used only when the AI is unreachable) ── */
 
 function getAIResponse(
   userInput: string,
@@ -1054,6 +1237,7 @@ function getAIResponse(
   askedStock: StockData | null = null,
   liveStocks: StockData[] = [],
   scholarshipFeed: ScholarshipFeed | null = null,
+  recommendations: Recommendations | null = null,
 ): string {
   const input = userInput.toLowerCase();
   const matches = user ? calculateSchemeMatches(user).slice(0, 3) : [];
@@ -1083,6 +1267,14 @@ function getAIResponse(
       `- ${stock.symbol}: ${formatSignal(stock.signal)} signal, CMP ${formatStockPrice(stock)}, RSI ${stock.rsi_14}, PE ${stock.pe_ratio}`,
     ).join('\n');
     return `${profileIntro}here are stock ideas from the DhanSathi screener:\n\n${ideas || '- I could not identify the stock name/symbol. Try asking "explain RELIANCE stock" or "TCS RSI signal".'}\n\nFor a master stock view, ask with a company name or NSE symbol. I will fetch CMP, change %, volume, RSI, SMA trend and signal. Use this for education only. Keep position size small, define a stop-loss before entry, and do not trade without your own confirmation.`;
+  }
+
+  if (recommendations && BENEFIT_INTENT.test(userInput)) {
+    const items = [...recommendations.scholarships.slice(0, 3), ...recommendations.schemes.slice(0, 5)];
+    const missing = missingProfileFields(user);
+    return `${profileIntro}${recommendations.eligible_total} schemes on DhanSathi match your profile (${recommendations.filters_applied.join('; ') || 'profile incomplete'}). Most relevant to your question:\n\n${items
+      .map((item) => `- ${item.name} (${item.state}): ${item.description} [Details](${item.url})`)
+      .join('\n')}\n\n${missing.length ? `Add ${missing.join(', ')} in Settings for sharper matches.\n\n` : ''}Tap Details on a card to see benefits, documents and how to apply.`;
   }
 
   if (
@@ -1115,12 +1307,16 @@ function getAIResponse(
   }
 
   if (input.includes('market') || input.includes('update')) {
-    return 'Here\'s today\'s market snapshot:\n\n- Nifty 50: 22,456.80 (+0.72%)\n- Sensex: 73,891.25 (+0.68%)\n- India VIX: 13.42 (-2.1%)\n\nTop Gainers: BHARTIARTL (+3.2%), TATAMOTORS (+2.8%)\nTop Losers: WIPRO (-1.4%), INFY (-0.9%)\n\nFII activity: Net buyers ₹1,245 Cr today. Overall sentiment is cautiously bullish.';
+    if (!liveStocks.length) return 'Live market data could not be loaded right now. Please open the Stocks page for the latest prices.';
+    const sorted = [...liveStocks].sort((a, b) => b.change_pct - a.change_pct);
+    const fmt = (s: StockData) => `${s.symbol} (${s.change_pct >= 0 ? '+' : ''}${s.change_pct.toFixed(2)}%)`;
+    const up = liveStocks.filter((s) => s.change_pct > 0).length;
+    return `Live Nifty 50 snapshot:\n\n- Advancing: ${up}, declining: ${liveStocks.length - up}\n- Top gainers: ${sorted.slice(0, 3).map(fmt).join(', ')}\n- Top losers: ${sorted.slice(-3).reverse().map(fmt).join(', ')}\n\nOpen the Stocks page for full live data.`;
   }
 
   if (input.includes('eligib') || input.includes('scheme') || input.includes('yojana')) {
     const schemeSummary = matches.map((match) =>
-      `- ${match.scheme.name} (${match.score}% match): ${match.scheme.benefits}. Why: ${match.reasons.slice(0, 2).join(', ') || 'profile match'}`,
+      `- ${match.scheme.name} (${match.score}% match): ${match.scheme.benefits || match.scheme.description}. Why: ${match.reasons.slice(0, 2).join(', ') || 'profile match'}`,
     ).join('\n');
     return `${profileIntro}these schemes look most relevant:\n\n${schemeSummary || '- I need your state, income, age, category, and occupation in Settings to match schemes accurately.'}\n\nOpen each scheme page, confirm documents, and check the official application link before applying.`;
   }

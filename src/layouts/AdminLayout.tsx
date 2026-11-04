@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Outlet, NavLink, useLocation } from 'react-router-dom';
+import { Navigate, Outlet, NavLink, useLocation } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
 
@@ -43,6 +43,16 @@ export default function AdminLayout() {
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const location = useLocation();
   const breadcrumbs = getBreadcrumbs(location.pathname);
+
+  // Client-side gate: without an admin session, bounce to the login page.
+  // This is defence-in-depth only — the real protection is Supabase
+  // row-level security (the admin_users table + is_admin()), which returns no
+  // data to a non-admin even if they reach these screens.
+  const isAdminSession =
+    typeof window !== 'undefined' && sessionStorage.getItem('dhansathi_admin') === 'true';
+  if (!isAdminSession) {
+    return <Navigate to="/admin/login" replace state={{ from: location.pathname }} />;
+  }
 
   const isActive = (path: string) => {
     if (path === '/admin') return location.pathname === '/admin';
